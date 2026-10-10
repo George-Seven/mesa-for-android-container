@@ -18,6 +18,11 @@
 
 #include "av1_bitstream.h"
 
+/* VA-API does not expose AV1's sequence-level restoration capability in the
+ * decode picture structure.  Keep the reconstructed stream self-consistent
+ * by disabling this optional post-filter until that state can be propagated. */
+#define DMD_AV1_ENABLE_RESTORATION 0
+
 /* ---------------------------------------------------------------- leb128 */
 
 size_t dmd_av1_leb128_len(uint64_t v)
@@ -221,7 +226,7 @@ static void put_color_config(struct dmd_bitwriter *bw,
 
 /* tile_info(), AV1 specification 5.9.15.
  *
- * tile_size_bytes_minus_1 is fixed at 3 (four bytes) here.  tile_group must
+ * tile_size_bytes_minus_1 is fixed at 1 (two bytes) here.  tile_group must
  * use the same width for tile_size_minus_1; otherwise the decoder reads tile
  * lengths with the wrong width and becomes misaligned from the second tile.
  *
@@ -248,7 +253,7 @@ static void put_color_config(struct dmd_bitwriter *bw,
  *   v == max -> write (max - min) ones, with no stop bit;
  *   otherwise -> write (v - min) ones followed by a zero.
  *
- * tile_size_bytes_minus_1 is fixed at 3 (four bytes), and tile_group must use
+ * tile_size_bytes_minus_1 is fixed at 1 (two bytes), and tile_group must use
  * the same width for tile_size_minus_1; a mismatch misaligns every tile after
  * the first. */
 static void put_tile_info(struct dmd_bitwriter *bw,
@@ -385,8 +390,9 @@ static void put_quantization_params(struct dmd_bitwriter *bw,
     if (p->qmatrix_fields.bits.using_qmatrix) {
         dmd_bw_put_bits(bw, p->qmatrix_fields.bits.qm_y, 4);
         dmd_bw_put_bits(bw, p->qmatrix_fields.bits.qm_u, 4);
-        if (!mono)
-            dmd_bw_put_bits(bw, p->qmatrix_fields.bits.qm_v, 4);
+        /* put_color_config() fixes separate_uv_delta_q to zero.  AV1 then
+         * derives qm_v from qm_u; emitting the VA field here would add four
+         * bits which are not present in the reconstructed sequence. */
     }
 }
 
@@ -516,17 +522,20 @@ static void put_lr_params(struct dmd_bitwriter *bw,
                           const VADecPictureParameterBufferAV1 *p,
                           int all_lossless, int allow_intrabc)
 {
-    if (all_lossless || allow_intrabc)
+    /* VADecPictureParameterBufferAV1 does not carry the sequence-level
+     * enable_restoration flag.  The bridge therefore emits a sequence with
+     * restoration disabled and must omit this frame-level section as well.
+     * Loop restoration is a post-filter; the tile payload remains valid. */
+    if (!DMD_AV1_ENABLE_RESTORATION || all_lossless || allow_intrabc)
         return;
 
     const uint32_t ry = p->loop_restoration_fields.bits.yframe_restoration_type;
     const uint32_t rcb = p->loop_restoration_fields.bits.cbframe_restoration_type;
     const uint32_t rcr = p->loop_restoration_fields.bits.crframe_restoration_type;
 
-    /* The sequence header always sets enable_restoration to one, so this
-     * section is always present even when all three lr_type values are zero
-     * (the proper representation of no restoration for this frame).  An
-     * earlier all-zero early return made the frame header six bits too short. */
+    /* When restoration is enabled, this section is present even when all
+     * three lr_type values are zero (the proper representation of no
+     * restoration for this frame). */
 
     /* lr_type uses f(2), in the same order as the VA-API restoration_type
      * enum (0=NONE, 1=WIENER, 2=SGRPROJ, 3=SWITCHABLE). */
@@ -666,29 +675,15 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     if (enable_order_hint)
         dmd_bw_put_bits(&bw, p->order_hint_bits_minus_1, 3);
 
-    /* VA-API also omits enable_superres and enable_restoration, so infer them
-     * from the frame fields:
-     *   use_superres (:432), and
-     *   the three *frame_restoration_type values (:608-610; non-zero enables).
-     * Unlike warped_motion, these values change the frame-header syntax and
-     * must be accurate; a wrong value shifts the rest of the header. */
+    /* VA-API omits enable_superres.  Infer the frame-level super-resolution
+     * syntax from use_superres; restoration is disabled in the reconstructed
+     * sequence because VA-API does not expose its sequence-level capability. */
     const int use_superres = (int)p->pic_info_fields.bits.use_superres;
 
     dmd_bw_put_flag(&bw, use_superres);
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_cdef);
-    /* enable_restoration is always one.
-     *
-     * Inferring this from whether all three frame_restoration_type values are
-     * zero was wrong.  trace_headers shows enable_restoration=1 in the real
-     * stream, and the six lr_type[0..2] bits are present at frame-header bit
-     * 204 even though their values are all zero.  In other words, a frame with
-     * no restoration is represented by lr_type=0, not by a sequence-level
-     * enable_restoration=0.  The latter removes the lr_params section, makes
-     * the header six bits too short, and shifts tile_group parsing.
-     *
-     * One is the safe capability value; each frame's lr_type still determines
-     * whether restoration is actually used. */
-    dmd_bw_put_flag(&bw, 1);
+    /* Keep this in sync with put_lr_params(). */
+    dmd_bw_put_flag(&bw, DMD_AV1_ENABLE_RESTORATION);
 
     put_color_config(&bw, p);
 
@@ -1030,11 +1025,11 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (populated_refs >= 2)
         dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.skip_mode_present);
 
-    /* allow_warped_motion requires is_motion_mode_switchable, a non-error-
-     * resilient frame and the sequence-level enable_warped_motion bit (set to
-     * one above). */
-    if (!intra_only &&
-        p->pic_info_fields.bits.is_motion_mode_switchable && !err_res)
+    /* allow_warped_motion is present for every inter frame which is not
+     * error-resilient when the sequence-level capability is enabled.  It is
+     * independent of is_motion_mode_switchable; that flag controls the
+     * interpolation mode field earlier in the header. */
+    if (!intra_only && !err_res)
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.allow_warped_motion);
 
     dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
@@ -1138,7 +1133,7 @@ size_t dmd_av1_build_frame(const void *pic_v,
      *   remaining OBU payload
      *
      * tile_size_minus_1 uses le(2), and its width must match the
-     * tile_size_bytes_minus_1 = 3 written by tile_info; a mismatch misaligns
+     * tile_size_bytes_minus_1 = 1 written by tile_info; a mismatch misaligns
      * every tile after the first. */
     const uint32_t tile_total =
         (uint32_t)p->tile_cols * (uint32_t)p->tile_rows;
