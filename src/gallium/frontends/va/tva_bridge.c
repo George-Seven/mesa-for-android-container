@@ -528,16 +528,54 @@ struct tva_codec {
 
     /* reader thread machinery */
     mtx_t pend_mutex;
+    /* The reader can request a reversible decoder drain when the terminal
+     * AV1 frame is still held by MediaCodec.  Serialize that request with
+     * picture submission so a drain length prefix cannot interleave with an
+     * access-unit write on the same non-blocking socket. */
+    mtx_t io_mutex;
+    /* Serializes AV1 temporal-unit assembly between the VA submission thread
+     * and the fence path, which may have to flush the final pending unit. */
+    mtx_t av1_mutex;
     struct u_cnd_monotonic pend_cond;
     bool quitting;
     thrd_t reader;
     bool reader_started;
+    bool av1_drain_sent;
 };
 
 static struct tva_codec *
 tva_codec(struct pipe_video_codec *codec)
 {
     return (struct tva_codec *)codec;
+}
+
+/* The daemon connection is full duplex, but its byte stream is not safe for
+ * concurrent writers.  Keep all access-unit and drain requests serialized;
+ * the reader thread remains free to receive frames while a writer is active. */
+static int
+tva_send_unit(struct tva_codec *c, const void *data, size_t len)
+{
+   int ret;
+
+   if (!c || !c->sess)
+      return TVA_ERR_STATE;
+   mtx_lock(&c->io_mutex);
+   ret = tva_session_send_unit(c->sess, data, len);
+   mtx_unlock(&c->io_mutex);
+   return ret;
+}
+
+static int
+tva_send_drain(struct tva_codec *c)
+{
+   int ret;
+
+   if (!c || !c->sess)
+      return TVA_ERR_STATE;
+   mtx_lock(&c->io_mutex);
+   ret = tva_session_drain(c->sess);
+   mtx_unlock(&c->io_mutex);
+   return ret;
 }
 
 /* ---------------------------- NALU classification (upstream port) */
@@ -874,6 +912,26 @@ tva_av1_fence_destroy_wait_ms(void)
     unsigned long value = strtoul(e, &end, 10);
     if (end == e || *end || value > 5000)
         return TVA_FENCE_DESTROY_WAIT_MS;
+    return (unsigned)value;
+}
+
+/* Pixel's AV1 MediaCodec keeps the last showable picture queued until it is
+ * told that no more input follows.  VA-API has no explicit decoder flush
+ * callback, so a fence for the newest submitted AV1 unit may otherwise wait
+ * forever at end of stream.  Keep the safety valve conservative: normal
+ * decode latency is far below this default, while a stalled terminal frame
+ * is released by the daemon's reversible drain. */
+static unsigned
+tva_av1_drain_idle_ms(void)
+{
+    const char *e = getenv("DMD_AV1_DRAIN_IDLE_MS");
+    if (!e || !*e)
+        return 5000;
+
+    char *end = NULL;
+    unsigned long value = strtoul(e, &end, 10);
+    if (end == e || *end || value < 100 || value > 60000)
+        return 5000;
     return (unsigned)value;
 }
 
@@ -2863,7 +2921,7 @@ tva_av1_send_pending(struct tva_codec *c)
                       i + 1, (unsigned)c->next_unit + 1,
                       pic->picture.pic_info_fields.bits.show_frame,
                       map_idx, pic->refresh_frame_flags);
-            if (tva_session_send_unit(c->sess, unit, unit_len) != TVA_OK) {
+            if (tva_send_unit(c, unit, unit_len) != TVA_OK) {
                 debug_printf("tva: AV1 inline send failed: %s\n",
                              tva_session_last_error(c->sess));
                 free(unit);
@@ -2957,7 +3015,7 @@ tva_av1_send_pending(struct tva_codec *c)
                       pic->refresh_frame_flags, pic->picture.order_hint,
                       pic->picture.pic_info_fields.bits.frame_type,
                       i == 0 && frame->include_sequence ? " sequence" : "");
-            if (tva_session_send_unit(c->sess, unit, unit_len) != TVA_OK) {
+            if (tva_send_unit(c, unit, unit_len) != TVA_OK) {
                 debug_printf("tva: AV1 send_unit failed: %s\n",
                              tva_session_last_error(c->sess));
                 free(unit);
@@ -3065,7 +3123,7 @@ too_large:
         mtx_unlock(&c->pend_mutex);
     }
 
-    if (tva_session_send_unit(c->sess, unit, unit_len) != TVA_OK) {
+    if (tva_send_unit(c, unit, unit_len) != TVA_OK) {
         debug_printf("tva: AV1 send_unit failed: %s\n",
                      tva_session_last_error(c->sess));
         free(unit);
@@ -3105,7 +3163,7 @@ too_large:
             const size_t show_len = show_hdr + show_obu;
             TVA_TRACE("AV1 synthetic show_existing unit=%u map=%u refresh=%02x",
                       (unsigned)c->next_unit + 1, map_idx, mask);
-            if (tva_session_send_unit(c->sess, show_unit, show_len) != TVA_OK) {
+            if (tva_send_unit(c, show_unit, show_len) != TVA_OK) {
                 debug_printf("tva: AV1 show_existing send failed: %s\n",
                              tva_session_last_error(c->sess));
                 tva_av1_pending_clear(frame);
@@ -3124,6 +3182,25 @@ failed:
     tva_av1_pending_clear(frame);
     tva_mark_broken(c);
     return -1;
+}
+
+/* Flush a temporal unit while serializing access to the AV1 assembly state.
+ * The normal VA submission path and a late fence wait can reach this helper
+ * from different FFmpeg worker threads at end of stream. */
+static int
+tva_av1_flush_pending(struct tva_codec *c, bool terminal)
+{
+    int ret;
+
+    if (!c)
+        return -1;
+    mtx_lock(&c->av1_mutex);
+    if (terminal && c->av1_pending.picture_count)
+        c->av1_pending.pictures[c->av1_pending.picture_count - 1]
+            .refresh_frame_flags = 0;
+    ret = tva_av1_send_pending(c);
+    mtx_unlock(&c->av1_mutex);
+    return ret;
 }
 
 /*
@@ -3235,9 +3312,9 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
                     c->csd = csd;
                     c->csd_len = nlen;
                     csd = NULL;
-                    int rc1 = tva_session_send_unit(c->sess, sps_buf, sps_len);
+                    int rc1 = tva_send_unit(c, sps_buf, sps_len);
                     int rc2 = rc1 == TVA_OK
-                              ? tva_session_send_unit(c->sess, pps_buf, pps_len)
+                              ? tva_send_unit(c, pps_buf, pps_len)
                               : rc1;
                     if (rc2 != TVA_OK) {
                         debug_printf("tva: CSD send failed: %s\n",
@@ -3314,13 +3391,13 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
                     c->csd_len = nlen;
                     csd = NULL;
 
-                    int rc = tva_session_send_unit(c->sess,
+                    int rc = tva_send_unit(c,
                                                     c->csd, vps_len);
                     if (rc == TVA_OK)
-                        rc = tva_session_send_unit(c->sess,
+                        rc = tva_send_unit(c,
                                                     c->csd + vps_len, sps_len);
                     if (rc == TVA_OK)
-                        rc = tva_session_send_unit(c->sess,
+                        rc = tva_send_unit(c,
                                                     c->csd + vps_len + sps_len,
                                                     pps_len);
                     if (rc != TVA_OK) {
@@ -3409,7 +3486,7 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
 
         TVA_TRACE("access unit len=%zu vcl=%d unit=%u", c->acc_len,
                   have_vcl, picture_unit);
-        int r = tva_session_send_unit(c->sess, c->acc, c->acc_len);
+        int r = tva_send_unit(c, c->acc, c->acc_len);
         if (r != TVA_OK) {
             debug_printf("tva: send_unit failed: %s\n",
                          tva_session_last_error(c->sess));
@@ -3497,7 +3574,7 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
         if (boundary) {
             TVA_TRACE("AV1 group flush before show frame: pictures=%u",
                       frame->picture_count);
-            if (tva_av1_send_pending(c)) {
+            if (tva_av1_flush_pending(c, false)) {
                 c->acc_len = 0;
                 return -1;
             }
@@ -3671,7 +3748,7 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
         }
         TVA_TRACE("sending whole VP9 frame, len=%zu unit=%u show=%d",
                   c->acc_len, unit_seq, show_frame);
-        int r = tva_session_send_unit(c->sess, c->acc, c->acc_len);
+        int r = tva_send_unit(c, c->acc, c->acc_len);
         if (r != TVA_OK) {
             debug_printf("tva: send_unit failed: %s\n",
                          tva_session_last_error(c->sess));
@@ -3707,13 +3784,7 @@ tva_codec_flush(struct pipe_video_codec *codec)
     if (!c->av1_pending.valid || tva_codec_is_broken(c))
         return;
 
-    /* No following VA descriptor is available at end of stream.  The final
-     * picture does not need to be referenced by a later picture, so its zero
-     * mask is sufficient; key frames infer all slots and do not code it. */
-    if (c->av1_pending.picture_count)
-        c->av1_pending.pictures[c->av1_pending.picture_count - 1]
-            .refresh_frame_flags = 0;
-    (void)tva_av1_send_pending(c);
+    (void)tva_av1_flush_pending(c, true);
 }
 
 /*
@@ -3744,6 +3815,8 @@ tva_codec_fence_wait(struct pipe_video_codec *codec,
     uint64_t deadline_ns = infinite ? UINT64_MAX :
                            os_time_get_nano() + timeout;
     int ret = 1;
+    const bool av1 = u_reduce_video_profile(c->base.profile) ==
+                     PIPE_VIDEO_FORMAT_AV1;
 
     mtx_lock(&c->pend_mutex);
     if (fence->failed) {
@@ -3756,6 +3829,8 @@ tva_codec_fence_wait(struct pipe_video_codec *codec,
         return 1;
     }
     p->waiters++;
+    const uint64_t wait_start_ns = os_time_get_nano();
+    const uint64_t drain_after_ns = (uint64_t)tva_av1_drain_idle_ms() * 1000000ull;
     while (!p->ready) {
         if (!infinite && timeout == 0) {
             ret = 0;
@@ -3765,6 +3840,59 @@ tva_codec_fence_wait(struct pipe_video_codec *codec,
         if (!infinite && now >= deadline_ns) {
             ret = 0;
             break;
+        }
+
+        /* A final AV1 picture is held until the next VA descriptor so its
+         * refresh mask can be inferred from the following reference map.  At
+         * EOF there is no next descriptor.  Only flush after the same
+         * conservative idle period used by the EOS fallback; ordinary
+         * temporal-unit fences can therefore wait for their next descriptor
+         * without being submitted out of order. */
+        if (av1 && c->av1_pending.valid && p->unit_seq > c->next_unit &&
+            now - wait_start_ns >= drain_after_ns) {
+            TVA_TRACE("flushing terminal AV1 unit=%u idle=%.3f ms",
+                      p->unit_seq,
+                      (double)(now - wait_start_ns) / 1000000.0);
+            mtx_unlock(&c->pend_mutex);
+            int flush_ret = tva_av1_flush_pending(c, true);
+            mtx_lock(&c->pend_mutex);
+            if (flush_ret != 0) {
+                TVA_TRACE("terminal AV1 flush failed: %d", flush_ret);
+                c->broken = true;
+                p->ready = true;
+                p->failed = true;
+                u_cnd_monotonic_broadcast(&c->pend_cond);
+                ret = 0;
+                break;
+            }
+            continue;
+        }
+
+        /* Qualcomm's AV1 decoder may hold the terminal showable picture until
+         * input EOS.  VA-API does not expose an explicit decoder flush, and
+         * waiting for the fence before destroying the context therefore
+         * deadlocks at EOF.  The newest pending unit is the only safe point
+         * for this fallback: once it has been idle for several seconds, a
+         * reversible drain releases the frame and keeps the session usable. */
+        if (av1 && !c->av1_drain_sent && p->unit_seq == c->next_unit &&
+            now - wait_start_ns >= drain_after_ns) {
+            c->av1_drain_sent = true;
+            TVA_TRACE("AV1 terminal fence unit=%u idle=%.3f ms; sending drain",
+                      p->unit_seq,
+                      (double)(now - wait_start_ns) / 1000000.0);
+            mtx_unlock(&c->pend_mutex);
+            int drain_ret = tva_send_drain(c);
+            mtx_lock(&c->pend_mutex);
+            if (drain_ret != TVA_OK) {
+                TVA_TRACE("AV1 terminal drain failed: %d", drain_ret);
+                c->broken = true;
+                p->ready = true;
+                p->failed = true;
+                u_cnd_monotonic_broadcast(&c->pend_cond);
+                ret = 0;
+                break;
+            }
+            continue;
         }
         uint64_t wake_ns = infinite ? now + 200000000ull :
                            MIN2(deadline_ns, now + 200000000ull);
@@ -3873,6 +4001,8 @@ tva_codec_destroy(struct pipe_video_codec *codec)
         tva_pend_pop_locked(c);
     mtx_unlock(&c->pend_mutex);
     tva_av1_pending_clear(&c->av1_pending);
+    mtx_destroy(&c->io_mutex);
+    mtx_destroy(&c->av1_mutex);
     mtx_destroy(&c->pend_mutex);
     u_cnd_monotonic_destroy(&c->pend_cond);
     TVA_TRACE("codec destroy: %llu units, %llu frames", (unsigned long long)c->next_unit, (unsigned long long)c->frames_done);
@@ -4058,11 +4188,15 @@ tva_pipe_create_video_codec(struct pipe_context *context,
      * short decoder bursts while fence recycling still protects old surfaces. */
     c->strict_pending = codec_id == CODEC_AV1 && tva_av1_strict_pending();
 
+    mtx_init(&c->io_mutex, mtx_plain);
+    mtx_init(&c->av1_mutex, mtx_plain);
     mtx_init(&c->pend_mutex, mtx_plain);
     if (u_cnd_monotonic_init(&c->pend_cond) != thrd_success) {
         tva_session_destroy(c->sess);
         free(c->csd);
         free(c->acc);
+        mtx_destroy(&c->io_mutex);
+        mtx_destroy(&c->av1_mutex);
         mtx_destroy(&c->pend_mutex);
         FREE(c);
         return NULL;

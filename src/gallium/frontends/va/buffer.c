@@ -584,10 +584,16 @@ vlVaSyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
    }
 
+   /* Capture the decoder while both locks are held, then release the context
+    * lock before the potentially blocking callback.  Keeping it held while
+    * drv->mutex is released allows another VA thread to take drv->mutex and
+    * wait on the same context, which deadlocks when this thread reacquires
+    * drv->mutex after fence_wait returns. */
    mtx_lock(&context->mutex);
-   mtx_unlock(&drv->mutex);
-   int ret = context->decoder->fence_wait(context->decoder, buf->fence, timeout_ns);
+   struct pipe_video_codec *decoder = context->decoder;
    mtx_unlock(&context->mutex);
+   mtx_unlock(&drv->mutex);
+   int ret = decoder->fence_wait(decoder, buf->fence, timeout_ns);
    return ret ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_TIMEDOUT;
 }
 #endif

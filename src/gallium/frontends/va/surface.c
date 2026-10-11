@@ -335,11 +335,21 @@ vlVaSyncSurfaceObjectLocked(vlVaDriver *drv, vlVaSurface *surf,
       return VA_STATUS_ERROR_INVALID_CONTEXT;
    }
 
+   /* Do not hold context->mutex across the potentially blocking fence wait.
+    * Another VA thread may already hold drv->mutex and be trying to inspect a
+    * different surface in the same context; retaining context->mutex here
+    * would leave that thread holding drv->mutex while it waits for us, while
+    * this thread needs drv->mutex back after fence_wait returns.  Capture the
+    * stable decoder pointer while both locks are held, then release both
+    * locks before entering the driver callback.  Context and surface
+    * destruction also require drv->mutex, so the captured objects remain
+    * alive until we reacquire it below. */
    mtx_lock(&context->mutex);
-   mtx_unlock(&drv->mutex);
-   int ret = context->decoder->fence_wait(context->decoder, fence, timeout_ns);
-   TVA_EXPORT_LOG("sync decoder fence=%p result=%d\n", (void *)fence, ret);
+   struct pipe_video_codec *decoder = context->decoder;
    mtx_unlock(&context->mutex);
+   mtx_unlock(&drv->mutex);
+   int ret = decoder->fence_wait(decoder, fence, timeout_ns);
+   TVA_EXPORT_LOG("sync decoder fence=%p result=%d\n", (void *)fence, ret);
    mtx_lock(&drv->mutex);
    return ret ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_TIMEDOUT;
 }
