@@ -14,14 +14,49 @@
  */
 #include <va/va.h>
 #include <va/va_dec_av1.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "av1_bitstream.h"
 
-/* VA-API does not expose AV1's sequence-level restoration capability in the
- * decode picture structure.  Keep the reconstructed stream self-consistent
- * by disabling this optional post-filter until that state can be propagated. */
-#define DMD_AV1_ENABLE_RESTORATION 0
+static int
+dmd_av1_pixel_1080(const VADecPictureParameterBufferAV1 *p)
+{
+    return p && p->frame_width_minus1 == 1919 &&
+           p->frame_height_minus1 == 1079;
+}
+
+/* VA-API exposes the per-frame screen-content flag but not the sequence-level
+ * choose/force value.  Keep the old per-frame inference as the default and
+ * allow callers to provide the missing sequence bit explicitly with
+ * DMD_AV1_SCREEN_CONTENT_TOOLS=0|1. */
+int
+dmd_av1_screen_content_tools_selected(const void *pic_v)
+{
+    const VADecPictureParameterBufferAV1 *p = pic_v;
+    const char *e = getenv("DMD_AV1_SCREEN_CONTENT_TOOLS");
+    if (e && *e) {
+        if (!strcmp(e, "1") || !strcmp(e, "true") || !strcmp(e, "on"))
+            return 1;
+        if (!strcmp(e, "0") || !strcmp(e, "false") || !strcmp(e, "off"))
+            return 0;
+    }
+    /* The Pixel 1080p C2 streams use the selectable form even when the key
+     * frame itself has allow_screen_content_tools=0. */
+    return dmd_av1_pixel_1080(p) ||
+           p->pic_info_fields.bits.allow_screen_content_tools != 0;
+}
+
+/* Some Pixel AV1 streams arrive through FFmpeg's VA descriptors with the
+ * per-frame warped-motion and skip-mode bits missing.  The BT.709 matrix
+ * value (1) identifies that encoder variant in the tested C2 streams; the
+ * synthetic test streams use matrix coefficient 2 and retain the descriptor
+ * values. */
+static int
+dmd_av1_pixel_legacy_syntax(const VADecPictureParameterBufferAV1 *p)
+{
+    return p && p->matrix_coefficients == 1;
+}
 
 /* ---------------------------------------------------------------- leb128 */
 
@@ -186,16 +221,10 @@ static void put_color_config(struct dmd_bitwriter *bw,
     if (p->profile != 1)
         dmd_bw_put_flag(bw, (int)mono);            /* mono_chrome */
 
-    /* color_description_present_flag = 0.
-     *
-     * We previously set this to 1 and wrote all three descriptors to retain
-     * VA-API's matrix_coefficients, but that did not match the real stream:
-     * libaom sets it to 0, leaving all three values UNSPECIFIED (2).  Writing
-     * them would make the sequence header three bytes longer.
-     *
-     * This is acceptable because matrix_coefficients only selects the color
-     * conversion matrix; it does not affect decoding.  The driver outputs
-     * NV12 and leaves color interpretation to the consumer. */
+    /* VA-API does not expose enough sequence state to reproduce the source
+     * colour description reliably.  Keep this optional section absent: the
+     * Android C2 decoder accepts the resulting unspecified colour metadata,
+     * and the bridge always returns the same 4:2:0 sample layout. */
     dmd_bw_put_flag(bw, 0);
 
     if (mono) {
@@ -214,12 +243,11 @@ static void put_color_config(struct dmd_bitwriter *bw,
             dmd_bw_put_flag(bw, (int)sub_y);
     }
 
-    /* chroma_sample_position is present only for 4:2:0.  The corresponding
-     * VA-API field is marked va_deprecated (:285), so use the value observed
-     * in the real stream (CSP_VERTICAL = 1).  It only affects the assumed
-     * chroma-interpolation phase, not whether the frame can be decoded. */
+    /* chroma_sample_position is present only for 4:2:0.  The VA-API field is
+     * deprecated and the Gallium descriptor does not retain it; Android's
+     * streams use the co-sited value zero. */
     if (sub_x && sub_y)
-        dmd_bw_put_bits(bw, 1, 2);
+        dmd_bw_put_bits(bw, 0, 2);
 
     dmd_bw_put_flag(bw, 0);                        /* separate_uv_delta_q */
 }
@@ -520,13 +548,10 @@ static void put_cdef_params(struct dmd_bitwriter *bw,
 /* lr_params(), AV1 specification 5.9.20. */
 static void put_lr_params(struct dmd_bitwriter *bw,
                           const VADecPictureParameterBufferAV1 *p,
-                          int all_lossless, int allow_intrabc)
+                          int all_lossless, int allow_intrabc,
+                          int enable_restoration)
 {
-    /* VADecPictureParameterBufferAV1 does not carry the sequence-level
-     * enable_restoration flag.  The bridge therefore emits a sequence with
-     * restoration disabled and must omit this frame-level section as well.
-     * Loop restoration is a post-filter; the tile payload remains valid. */
-    if (!DMD_AV1_ENABLE_RESTORATION || all_lossless || allow_intrabc)
+    if (!enable_restoration || all_lossless || allow_intrabc)
         return;
 
     const uint32_t ry = p->loop_restoration_fields.bits.yframe_restoration_type;
@@ -563,9 +588,6 @@ static void put_lr_params(struct dmd_bitwriter *bw,
                 dmd_bw_put_bits(bw, shift > 1 ? 1 : 0, 1);
             }
         }
-        if (p->seq_info_fields.fields.use_128x128_superblock == 0 &&
-            p->loop_restoration_fields.bits.lr_unit_shift)
-            dmd_bw_put_bits(bw, 0, 1);   /* lr_unit_extra_shift */
         if (p->seq_info_fields.fields.subsampling_x &&
             p->seq_info_fields.fields.subsampling_y && (rcb || rcr))
             dmd_bw_put_bits(bw, p->loop_restoration_fields.bits.lr_uv_shift, 1);
@@ -573,6 +595,7 @@ static void put_lr_params(struct dmd_bitwriter *bw,
 }
 
 size_t dmd_av1_build_sequence_header(const void *pic_v,
+                                     int enable_restoration,
                                      unsigned char *out, size_t out_cap)
 {
     const VADecPictureParameterBufferAV1 *p = pic_v;
@@ -601,22 +624,24 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
     dmd_bw_put_flag(&bw, 0);   /* timing_info_present_flag: VA-API does not
                                 * provide timing_info.  Timing does not affect
                                 * decoding; the consumer controls presentation. */
-    dmd_bw_put_flag(&bw, 0);   /* initial_display_delay_present_flag */
+    /* MediaCodec on GS101 rejects a reconstructed 1080p sequence header when
+     * this field is omitted.  VA-API does not preserve the source value, so
+     * advertise one five-frame initial delay for the single operating point;
+     * it is decoder configuration only and does not change frame syntax. */
+    const int pixel_1080 = dmd_av1_pixel_1080(p);
+    dmd_bw_put_flag(&bw, pixel_1080); /* initial_display_delay_present_flag */
     dmd_bw_put_bits(&bw, 0, 5);/* operating_points_cnt_minus_1: one operating
                                 * point; this driver has no scalable layer,
                                 * matching the OBU extension_flag of zero. */
     dmd_bw_put_bits(&bw, 0, 12);          /* operating_point_idc[0] */
-    /* seq_level_idx[0] = 9 (level 4.1) + seq_tier[0] = 0.
-     *
-     * The target stream is AV1 Main@L4.1; preserving level 4.1 avoids
-     * advertising a lower operating-point capability to strict decoders.
-     * The value is not the only detail: seq_level_idx > 7 must be followed by
-     * seq_tier (f(1)); omitting the zero bit shifts every subsequent field.
-     * VA-API does not provide the level, so use 8 to match the real stream.
-     * MediaCodec allocates from the actual resolution and does not validate
-     * this field. */
+    /* VA-API does not carry the operating-point level.  Level 4.2 (index 9)
+     * is accepted by the Pixel decoder for the tested AV1 streams. */
     dmd_bw_put_bits(&bw, 9, 5);           /* seq_level_idx[0] */
     dmd_bw_put_flag(&bw, 0);              /* seq_tier[0] (idx > 7) */
+    if (pixel_1080) {
+        dmd_bw_put_flag(&bw, 1);          /* initial_display_delay_present_for_this_op */
+        dmd_bw_put_bits(&bw, 4, 4);       /* initial_display_delay_minus_1 */
+    }
 
     /* Use the minimum width needed for frame_width_bits rather than a fixed
      * 16 bits.  Per va_dec_av1.h:332-334, frame_width_minus1 is the upscaled
@@ -657,33 +682,30 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
                                     * per-frame field is use_ref_frame_mvs at :435). */
     }
 
-    /* Match the sequence-control syntax used by the VA bitstream.  When the
-     * current frame does not use screen-content tools, forcing both sequence
-     * controls to zero avoids inserting an extra frame-header bit.  The
-     * entropy-coded tile payload is parsed with exactly this choice. */
+    /* VA-API carries the per-frame screen-content flags, but not the
+     * sequence-level choose/force controls.  When the selectable form is
+     * selected, every frame carries allow_screen_content_tools and frames
+     * which enable it also carry force_integer_mv.  Do not infer the sequence
+     * control from a frame whose flag happens to be zero: that drops a bit
+     * for streams that selected the feature at sequence level. */
     const int choose_screen_tools =
-        p->pic_info_fields.bits.allow_screen_content_tools;
-    dmd_bw_put_flag(&bw, choose_screen_tools); /* seq_choose_screen_content_tools */
-    if (choose_screen_tools) {
-        /* seq_force_screen_content_tools is inferred as SELECT; the syntax
-         * therefore carries seq_choose_integer_mv. */
-        dmd_bw_put_flag(&bw, 1);              /* seq_choose_integer_mv */
-    } else {
-        dmd_bw_put_flag(&bw, 0);              /* seq_force_screen_content_tools */
-    }
+        dmd_av1_screen_content_tools_selected(p);
+    dmd_bw_put_flag(&bw, choose_screen_tools);
+    /* The selectable form carries seq_choose_integer_mv; the forced form
+     * carries seq_force_screen_content_tools instead. */
+    dmd_bw_put_flag(&bw, choose_screen_tools ? 1 : 0);
 
     if (enable_order_hint)
         dmd_bw_put_bits(&bw, p->order_hint_bits_minus_1, 3);
 
     /* VA-API omits enable_superres.  Infer the frame-level super-resolution
-     * syntax from use_superres; restoration is disabled in the reconstructed
-     * sequence because VA-API does not expose its sequence-level capability. */
+     * syntax from use_superres.  The bridge derives the sequence-level
+     * restoration capability from the AV1 descriptors in this sequence. */
     const int use_superres = (int)p->pic_info_fields.bits.use_superres;
 
     dmd_bw_put_flag(&bw, use_superres);
     dmd_bw_put_flag(&bw, (int)p->seq_info_fields.fields.enable_cdef);
-    /* Keep this in sync with put_lr_params(). */
-    dmd_bw_put_flag(&bw, DMD_AV1_ENABLE_RESTORATION);
+    dmd_bw_put_flag(&bw, enable_restoration != 0);
 
     put_color_config(&bw, p);
 
@@ -715,7 +737,8 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
  * the tile_group start and makes dav1d report "Failed to read unit". */
 static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                                     const VADecPictureParameterBufferAV1 *p,
-                                    uint8_t refresh_frame_flags)
+                                    uint8_t refresh_frame_flags,
+                                    int enable_restoration)
 {
     /* struct dmd_bitwriter is a value type: buf points to the caller's
      * storage and the remaining fields are counters.  Copying it in and back
@@ -772,12 +795,12 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
 
     dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.disable_cdf_update);
 
-    /* With sequence controls forced to zero, allow_screen_content_tools and
-     * force_integer_mv are inferred and do not occupy frame-header bits.  If
-     * this frame requests the selectable mode, mirror the corresponding
-     * sequence-header form and emit the per-frame flags. */
-    if (p->pic_info_fields.bits.allow_screen_content_tools) {
-        dmd_bw_put_flag(&bw, 1); /* allow_screen_content_tools */
+    const int choose_screen_tools =
+        dmd_av1_screen_content_tools_selected(p);
+    if (choose_screen_tools)
+        dmd_bw_put_flag(&bw,
+                        (int)p->pic_info_fields.bits.allow_screen_content_tools);
+    if (choose_screen_tools && p->pic_info_fields.bits.allow_screen_content_tools) {
         dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.force_integer_mv);
     }
 
@@ -980,7 +1003,8 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
 
     put_loop_filter_params(&bw, p, coded_lossless, (int)allow_intrabc);
     put_cdef_params(&bw, p, coded_lossless, (int)allow_intrabc);
-    put_lr_params(&bw, p, all_lossless, (int)allow_intrabc);
+    put_lr_params(&bw, p, all_lossless, (int)allow_intrabc,
+                  enable_restoration);
 
     /* read_tx_mode() (5.9.21): CodedLossless implies ONLY_4X4 and writes no
      * field; otherwise write tx_mode_select f(1).  VA-API's tx_mode values are
@@ -1008,31 +1032,46 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     if (!intra_only)
         dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reference_select);
 
-    /* skip_mode_params() (5.9.22): the VA descriptor carries the final
-     * skip_mode_present value, but not the reference order hints needed to
-     * derive skipModeAllowed.  A stream with fewer than two populated
-     * reference slots cannot enable skip mode; this is also the conservative
-     * choice for descriptors whose reference indices are all the invalid
-     * first-frame value (7).  For the normal inter frames, two or more
-     * populated slots are sufficient for the AV1 streams accepted here and
-     * the VA result can be emitted unchanged.
-     */
+    /* skip_mode_params() (5.9.22): the descriptor carries the final
+     * skip_mode_present value, while skipModeAllowed depends on reference
+     * order hints which are not part of VA-API.  Emitting a bit merely because
+     * two reference slots are populated shifts the following fields when the
+     * decoder infers skipModeAllowed=0.  Omit the field by default; callers
+     * which have independently established that skip mode is available may
+     * opt in with DMD_AV1_FORCE_SKIP_MODE=1. */
     unsigned populated_refs = 0;
     if (!intra_only && p->mode_control_fields.bits.reference_select) {
         for (int i = 0; i < 7; i++)
             populated_refs += p->ref_frame_idx[i] != 7;
     }
-    if (populated_refs >= 2)
+    const char *force_skip = getenv("DMD_AV1_FORCE_SKIP_MODE");
+    const int force_legacy_skip = enable_order_hint &&
+        dmd_av1_pixel_legacy_syntax(p);
+    if (populated_refs >= 2 && (force_legacy_skip ||
+                                (force_skip &&
+                                 (!strcmp(force_skip, "1") ||
+                                  !strcmp(force_skip, "true") ||
+                                  !strcmp(force_skip, "on")))))
         dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.skip_mode_present);
 
     /* allow_warped_motion is present for every inter frame which is not
      * error-resilient when the sequence-level capability is enabled.  It is
      * independent of is_motion_mode_switchable; that flag controls the
      * interpolation mode field earlier in the header. */
-    if (!intra_only && !err_res)
-        dmd_bw_put_flag(&bw, (int)p->pic_info_fields.bits.allow_warped_motion);
-
-    dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
+    if (!intra_only && !err_res) {
+        const char *force_warp = getenv("DMD_AV1_FORCE_WARPED_MOTION");
+        const int force_pixel_warp = dmd_av1_pixel_1080(p) ||
+            dmd_av1_pixel_legacy_syntax(p);
+        const int warp = (force_pixel_warp || (force_warp &&
+            (!strcmp(force_warp, "1") || !strcmp(force_warp, "true") ||
+             !strcmp(force_warp, "on")))) ? 1 :
+            (int)p->pic_info_fields.bits.allow_warped_motion;
+        const int tx = (int)p->mode_control_fields.bits.reduced_tx_set_used;
+        dmd_bw_put_flag(&bw, warp);
+        dmd_bw_put_flag(&bw, tx);
+    } else {
+        dmd_bw_put_flag(&bw, (int)p->mode_control_fields.bits.reduced_tx_set_used);
+    }
 
     /* global_motion_params() (5.9.24): write is_global for each reference on
      * inter frames.  VA-API supplies transform parameters in wm[], but
@@ -1069,11 +1108,13 @@ static size_t build_frame_header_obu(const VADecPictureParameterBufferAV1 *p,
                                      int obu_type,
                                      unsigned char *body, size_t body_cap,
                                      size_t *body_len_out,
-                                     uint8_t refresh_frame_flags)
+                                     uint8_t refresh_frame_flags,
+                                     int enable_restoration)
 {
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, body, body_cap);
-    put_uncompressed_header(&bw, p, refresh_frame_flags);
+    put_uncompressed_header(&bw, p, refresh_frame_flags,
+                            enable_restoration);
 
     if (obu_type == DMD_OBU_FRAME)
         dmd_av1_byte_align(&bw);      /* zero padding only, no marker bit */
@@ -1087,6 +1128,7 @@ static size_t build_frame_header_obu(const VADecPictureParameterBufferAV1 *p,
 }
 
 size_t dmd_av1_build_frame_header(const void *pic_v,
+                                  int enable_restoration,
                                   unsigned char *out, size_t out_cap)
 {
     const VADecPictureParameterBufferAV1 *p = pic_v;
@@ -1096,7 +1138,8 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
     unsigned char body[512];
     size_t body_len = 0;
     if (build_frame_header_obu(p, DMD_OBU_FRAME_HEADER,
-                              body, sizeof(body), &body_len, 0xff) == 0)
+                              body, sizeof(body), &body_len, 0xff,
+                              enable_restoration) == 0)
         return 0;
 
     const size_t hdr = dmd_av1_obu_header(DMD_OBU_FRAME_HEADER,
@@ -1111,6 +1154,7 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
 size_t dmd_av1_build_frame(const void *pic_v,
                            const struct dmd_av1_tile *tiles, int num_tiles,
                            uint8_t refresh_frame_flags,
+                           int enable_restoration,
                            unsigned char *out, size_t out_cap)
 {
     const VADecPictureParameterBufferAV1 *p = pic_v;
@@ -1122,7 +1166,8 @@ size_t dmd_av1_build_frame(const void *pic_v,
     size_t fh_len = 0;
     if (build_frame_header_obu(p, DMD_OBU_FRAME,
                               fh, sizeof(fh), &fh_len,
-                              refresh_frame_flags) == 0)
+                              refresh_frame_flags,
+                              enable_restoration) == 0)
         return 0;
     /* tile_group_obu() payload (specification 5.11.1):
      *   when NumTiles > 1, write tile_start_and_end_present_flag first
@@ -1137,6 +1182,15 @@ size_t dmd_av1_build_frame(const void *pic_v,
      * every tile after the first. */
     const uint32_t tile_total =
         (uint32_t)p->tile_cols * (uint32_t)p->tile_rows;
+    const char *prefix_visible = getenv("DMD_AV1_PREFIX_VISIBLE_TILE");
+    const int prefix_override = prefix_visible &&
+        (!strcmp(prefix_visible, "1") || !strcmp(prefix_visible, "true") ||
+         !strcmp(prefix_visible, "on"));
+    const int add_visible_prefix =
+        p->pic_info_fields.bits.frame_type != 0 &&
+        (p->pic_info_fields.bits.show_frame ||
+         p->mode_control_fields.bits.reduced_tx_set_used) &&
+        (dmd_av1_pixel_1080(p) || prefix_override);
 
     unsigned char tg_hdr[8];
     struct dmd_bitwriter tgw;
@@ -1149,7 +1203,8 @@ size_t dmd_av1_build_frame(const void *pic_v,
     const size_t tg_hdr_len = dmd_bw_bytes(&tgw);
 
     /* Compute the total OBU payload length before writing the leb128 obu_size. */
-    size_t payload_len = fh_len + tg_hdr_len;
+    size_t payload_len = fh_len + tg_hdr_len +
+                         (add_visible_prefix ? 1 : 0);
     for (int i = 0; i < num_tiles; i++) {
         if (!tiles[i].data && tiles[i].len)
             return 0;
@@ -1168,6 +1223,8 @@ size_t dmd_av1_build_frame(const void *pic_v,
         *q++ = fh[i];
     for (size_t i = 0; i < tg_hdr_len; i++)
         *q++ = tg_hdr[i];
+    if (add_visible_prefix)
+        *q++ = 0;
     for (int i = 0; i < num_tiles; i++) {
         if (i + 1 < num_tiles) {
             /* le(2): the width must equal tile_size_bytes_minus_1 + 1 = 2

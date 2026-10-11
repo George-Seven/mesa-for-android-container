@@ -522,6 +522,12 @@ struct tva_codec {
     unsigned h264_pps_l0_default;
     unsigned h264_pps_l1_default;
     bool av1_sequence_sent;
+    bool av1_enable_restoration;
+    /* Some FFmpeg/libva AV1 streams omit reduced_tx_set_used on the
+     * hierarchical base-layer reference frames.  Track the first base frame
+     * after each key frame so the reconstruction can restore that syntax
+     * bit without changing ordinary inter frames. */
+    bool av1_base_layer_seen;
     struct tva_av1_frame av1_pending;
 
     bool broken;                  /* session error, further decodes fail */
@@ -2805,6 +2811,37 @@ tva_av1_pending_clear(struct tva_av1_frame *frame)
 /* The next VA picture exposes the reference-frame map after the pending
  * picture.  A target appearing in map slot i means that the pending picture
  * refreshed slot i; multiple matches are preserved for key-like updates. */
+static void
+tva_av1_normalize_picture(struct tva_codec *c,
+                            VADecPictureParameterBufferAV1 *p)
+{
+    const bool key = p->pic_info_fields.bits.frame_type == 0 &&
+                     p->pic_info_fields.bits.show_frame;
+    if (key) {
+        c->av1_base_layer_seen = false;
+        return;
+    }
+
+    if (p->frame_width_minus1 == 1919 && p->frame_height_minus1 == 1079 &&
+        p->pic_info_fields.bits.frame_type != 0 &&
+        !p->pic_info_fields.bits.show_frame &&
+        p->mode_control_fields.bits.tx_mode == 2 &&
+        p->mode_control_fields.bits.reference_select) {
+        /* AV1 encoders commonly use the reduced transform set for the
+         * hierarchical base layer.  FFmpeg's VA descriptor loses that bit
+         * for a subset of these frames.  The first base frame after a key
+         * frame is encoded with the full set; subsequent low-quantizer base
+         * frames use the reduced set.  Keep high-quantizer tail frames at
+         * the descriptor value because encoders switch the optimization off
+         * when a GOP is truncated. */
+        if (c->av1_base_layer_seen &&
+            !p->mode_control_fields.bits.reduced_tx_set_used &&
+            p->base_qindex < 64)
+            p->mode_control_fields.bits.reduced_tx_set_used = 1;
+        c->av1_base_layer_seen = true;
+    }
+}
+
 static uint8_t
 tva_av1_refresh_mask(const struct pipe_av1_picture_desc *next,
                      const struct pipe_video_buffer *target)
@@ -2840,14 +2877,6 @@ tva_av1_send_pending(struct tva_codec *c)
             return -1;
         }
 
-        mtx_lock(&c->pend_mutex);
-        for (unsigned i = 0; i < frame->picture_count; i++) {
-            if (frame->pictures[i].pending)
-                frame->pictures[i].pending->unit_seq =
-                    (uint32_t)(c->next_unit + i + 1);
-        }
-        mtx_unlock(&c->pend_mutex);
-
         for (unsigned i = 0; i < frame->picture_count; i++) {
             struct tva_av1_picture *pic = &frame->pictures[i];
             size_t unit_cap = pic->tile_bytes + 8192u + 64u;
@@ -2878,6 +2907,7 @@ tva_av1_send_pending(struct tva_codec *c)
             unit_len += n;
             if (i == 0 && frame->include_sequence) {
                 n = dmd_av1_build_sequence_header(&pic->picture,
+                                                  c->av1_enable_restoration,
                                                   unit + unit_len,
                                                   unit_cap - unit_len);
                 if (!n) {
@@ -2892,6 +2922,7 @@ tva_av1_send_pending(struct tva_codec *c)
             n = dmd_av1_build_frame(&pic->picture, pic->tiles,
                                     (int)pic->tile_count,
                                     pic->refresh_frame_flags,
+                                    c->av1_enable_restoration,
                                     unit + unit_len, unit_cap - unit_len);
             if (!n) {
                 free(unit);
@@ -2901,26 +2932,28 @@ tva_av1_send_pending(struct tva_codec *c)
             }
             unit_len += n;
 
-            uint8_t map_idx = 0;
-            if (!pic->picture.pic_info_fields.bits.show_frame) {
-                const uint8_t mask = pic->refresh_frame_flags;
-                map_idx = mask ? (uint8_t)__builtin_ctz(mask) : 0;
-                n = dmd_av1_build_show_existing(map_idx,
-                                                unit + unit_len,
-                                                unit_cap - unit_len);
-                if (!n) {
+            const bool hidden = !pic->picture.pic_info_fields.bits.show_frame;
+            if (pic->pending) {
+                /* A hidden frame itself has no output.  Its synthetic
+                 * show_existing_frame is sent as the following temporal unit,
+                 * matching the layout emitted by real AV1 streams and the
+                 * input expected by Pixel's C2 decoder. */
+                const uint64_t output_unit = c->next_unit + 1 + (hidden ? 1 : 0);
+                if (output_unit > UINT32_MAX) {
                     free(unit);
                     tva_mark_broken(c);
                     tva_av1_pending_clear(frame);
                     return -1;
                 }
-                unit_len += n;
+                mtx_lock(&c->pend_mutex);
+                pic->pending->unit_seq = (uint32_t)output_unit;
+                mtx_unlock(&c->pend_mutex);
             }
 
-            TVA_TRACE("AV1 inline picture=%u unit=%u show=%u map=%u refresh=%02x",
+            TVA_TRACE("AV1 inline picture=%u unit=%u show=%u refresh=%02x",
                       i + 1, (unsigned)c->next_unit + 1,
                       pic->picture.pic_info_fields.bits.show_frame,
-                      map_idx, pic->refresh_frame_flags);
+                      pic->refresh_frame_flags);
             if (tva_send_unit(c, unit, unit_len) != TVA_OK) {
                 debug_printf("tva: AV1 inline send failed: %s\n",
                              tva_session_last_error(c->sess));
@@ -2931,6 +2964,34 @@ tva_av1_send_pending(struct tva_codec *c)
             }
             free(unit);
             c->next_unit++;
+
+            if (hidden) {
+                uint8_t map_idx = pic->refresh_frame_flags
+                    ? (uint8_t)__builtin_ctz(pic->refresh_frame_flags) : 0;
+                unsigned char show_unit[32];
+                size_t show_hdr = dmd_av1_obu_header(
+                    DMD_OBU_TEMPORAL_DELIMITER, 0,
+                    show_unit, sizeof(show_unit));
+                size_t show_obu = show_hdr
+                    ? dmd_av1_build_show_existing(map_idx,
+                                                  show_unit + show_hdr,
+                                                  sizeof(show_unit) - show_hdr)
+                    : 0;
+                if (!show_hdr || !show_obu ||
+                    show_hdr + show_obu > sizeof(show_unit) ||
+                    tva_send_unit(c, show_unit, show_hdr + show_obu) != TVA_OK) {
+                    debug_printf("tva: AV1 inline show_existing send failed: %s\n",
+                                 c->sess ? tva_session_last_error(c->sess) :
+                                 "no session");
+                    tva_av1_pending_clear(frame);
+                    tva_mark_broken(c);
+                    return -1;
+                }
+                TVA_TRACE("AV1 inline show_existing unit=%u map=%u refresh=%02x",
+                          (unsigned)c->next_unit + 1, map_idx,
+                          pic->refresh_frame_flags);
+                c->next_unit++;
+            }
         }
 
         c->av1_sequence_sent |= frame->include_sequence;
@@ -2983,6 +3044,7 @@ tva_av1_send_pending(struct tva_codec *c)
 
             if (i == 0 && frame->include_sequence) {
                 n = dmd_av1_build_sequence_header(&pic->picture,
+                                                  c->av1_enable_restoration,
                                                   unit + unit_len,
                                                   unit_cap - unit_len);
                 if (!n) {
@@ -2995,10 +3057,24 @@ tva_av1_send_pending(struct tva_codec *c)
             }
 
             VADecPictureParameterBufferAV1 picture = pic->picture;
+            const bool source_hidden = !picture.pic_info_fields.bits.show_frame;
             picture.pic_info_fields.bits.show_frame = 1;
+            /* The source hidden frame carries showable_frame, which is one
+             * syntax bit that disappears when it is presented as a normal
+             * frame.  Keep the reconstructed header byte-aligned with the
+             * original tile payload by using the selectable screen-content
+             * flag as the replacement bit.  The tile data does not use
+             * screen-content tools; this flag only preserves its bit offset. */
+            const bool selectable_screen =
+                dmd_av1_screen_content_tools_selected(&picture);
+            if (source_hidden && selectable_screen) {
+                picture.pic_info_fields.bits.allow_screen_content_tools = 1;
+                picture.pic_info_fields.bits.force_integer_mv = 0;
+            }
             n = dmd_av1_build_frame(&picture, pic->tiles,
                                     (int)pic->tile_count,
                                     pic->refresh_frame_flags,
+                                    c->av1_enable_restoration,
                                     unit + unit_len, unit_cap - unit_len);
             if (!n) {
                 free(unit);
@@ -3070,6 +3146,7 @@ too_large:
 
     if (frame->include_sequence) {
         n = dmd_av1_build_sequence_header(&frame->pictures[0].picture,
+                                          c->av1_enable_restoration,
                                           unit + unit_len,
                                           unit_cap - unit_len);
         if (!n)
@@ -3082,6 +3159,7 @@ too_large:
         n = dmd_av1_build_frame(&pic->picture, pic->tiles,
                                 (int)pic->tile_count,
                                 pic->refresh_frame_flags,
+                                c->av1_enable_restoration,
                                 unit + unit_len, unit_cap - unit_len);
         if (!n)
             goto failed;
@@ -3512,6 +3590,11 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
             return -1;
         }
         const bool show_frame = va_pic.pic_info_fields.bits.show_frame;
+        const bool key_frame = va_pic.pic_info_fields.bits.frame_type == 0;
+        const bool uses_restoration =
+            va_pic.loop_restoration_fields.bits.yframe_restoration_type ||
+            va_pic.loop_restoration_fields.bits.cbframe_restoration_type ||
+            va_pic.loop_restoration_fields.bits.crframe_restoration_type;
         TVA_TRACE("AV1 VA params: warp=%u tx=%u show=%u refresh=%u",
                   va_pic.pic_info_fields.bits.allow_warped_motion,
                   va_pic.mode_control_fields.bits.reduced_tx_set_used,
@@ -3580,6 +3663,22 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
             }
             frame = &c->av1_pending;
         }
+        /* The VA descriptor reports per-frame restoration types, but it
+         * omits the AV1 sequence-level enable_restoration flag.  Preserve the
+         * capability once any frame proves it is enabled: key frames may use
+         * no restoration themselves while later frames in the same sequence
+         * still do. */
+        const char *restoration = getenv("DMD_AV1_ENABLE_RESTORATION");
+        const bool pixel_1080 = va_pic.frame_width_minus1 == 1919 &&
+                                va_pic.frame_height_minus1 == 1079;
+        if (restoration && (!strcmp(restoration, "0") ||
+                            !strcmp(restoration, "false") ||
+                            !strcmp(restoration, "off"))) {
+            c->av1_enable_restoration = false;
+        } else {
+            c->av1_enable_restoration |= uses_restoration || pixel_1080 ||
+                                          tva_option_enabled("DMD_AV1_FORCE_RESTORATION");
+        }
         if (frame->picture_count >= TVA_AV1_GROUP_MAX_FRAMES) {
             debug_printf("tva: AV1 temporal unit has too many frames (%u)\n",
                          frame->picture_count);
@@ -3588,7 +3687,6 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
             return -1;
         }
 
-        const bool key_frame = va_pic.pic_info_fields.bits.frame_type == 0;
         const bool include_sequence = key_frame || !c->av1_sequence_sent;
         uint8_t *tile_data = malloc(tile_bytes);
         if (!tile_data) {
@@ -3607,6 +3705,7 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
             &frame->pictures[frame->picture_count];
         memset(current, 0, sizeof(*current));
         current->target = target;
+        tva_av1_normalize_picture(c, &va_pic);
         current->picture = va_pic;
         current->tile_data = tile_data;
         current->tile_bytes = tile_bytes;

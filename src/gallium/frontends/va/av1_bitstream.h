@@ -55,6 +55,9 @@ enum {
 /* Maximum leb128 length (AV1 specification 4.10.5: eight bytes). */
 #define DMD_LEB128_MAX 8
 
+/* Resolve the sequence-level screen-content syntax which VA-API omits. */
+int dmd_av1_screen_content_tools_selected(const void *pic);
+
 /* --------------------------------------------------------- variable-length codes */
 
 /* leb128(v): little-endian groups of seven bits, with the high bit of each
@@ -110,6 +113,7 @@ void dmd_av1_trailing_bits(struct dmd_bitwriter *bw);
  * Write to out and return the total byte count; return 0 for insufficient
  * capacity or invalid parameters. */
 size_t dmd_av1_build_sequence_header(const void *pic,
+                                     int enable_restoration,
                                      unsigned char *out, size_t out_cap);
 
 /* ---------------------------------------------- OBU_FRAME assembly (3/4 + 4/4) */
@@ -140,6 +144,7 @@ struct dmd_av1_tile {
 size_t dmd_av1_build_frame(const void *pic,
                            const struct dmd_av1_tile *tiles, int num_tiles,
                            uint8_t refresh_frame_flags,
+                           int enable_restoration,
                            unsigned char *out, size_t out_cap);
 
 /* Build an OBU_FRAME_HEADER carrying show_existing_frame for a reference
@@ -160,6 +165,7 @@ size_t dmd_av1_build_show_existing(uint8_t map_idx,
  * Write to out and return the total byte count; return 0 for insufficient
  * capacity or invalid parameters. */
 size_t dmd_av1_build_frame_header(const void *pic,
+                                  int enable_restoration,
                                   unsigned char *out, size_t out_cap);
 
 /* obu_header() + obu_size (AV1 specification 5.3.1/5.3.2).
