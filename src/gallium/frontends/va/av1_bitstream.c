@@ -252,13 +252,25 @@ static void put_color_config(struct dmd_bitwriter *bw,
     dmd_bw_put_flag(bw, 0);                        /* separate_uv_delta_q */
 }
 
+/* Return the number of little-endian bytes needed for tile_size_minus_1 in
+ * tile_group().  AV1 signals this width in tile_info(), and all non-final
+ * tile lengths in the group must use the same width. */
+static unsigned
+dmd_av1_tile_size_bytes(const struct dmd_av1_tile *tiles, int num_tiles)
+{
+    size_t max_minus1 = 0;
+    for (int i = 0; i + 1 < num_tiles; i++) {
+        if (tiles[i].len > 0 && tiles[i].len - 1 > max_minus1)
+            max_minus1 = tiles[i].len - 1;
+    }
+
+    unsigned bytes = 1;
+    while (bytes < 4 && max_minus1 > (((size_t)1 << (bytes * 8)) - 1))
+        bytes++;
+    return bytes;
+}
+
 /* tile_info(), AV1 specification 5.9.15.
- *
- * tile_size_bytes_minus_1 is fixed at 1 (two bytes) here.  tile_group must
- * use the same width for tile_size_minus_1; otherwise the decoder reads tile
- * lengths with the wrong width and becomes misaligned from the second tile.
- *
- * tile_info(), AV1 specification 5.9.15.
  *
  * The boundary calculations in this function were wrong twice; they were
  * eventually checked line by line against FFmpeg's CBS implementation
@@ -281,12 +293,11 @@ static void put_color_config(struct dmd_bitwriter *bw,
  *   v == max -> write (max - min) ones, with no stop bit;
  *   otherwise -> write (v - min) ones followed by a zero.
  *
- * tile_size_bytes_minus_1 is fixed at 1 (two bytes), and tile_group must use
- * the same width for tile_size_minus_1; a mismatch misaligns every tile after
- * the first. */
+ * tile_size_bytes_minus_1 must match the width used by tile_group. */
 static void put_tile_info(struct dmd_bitwriter *bw,
                           const VADecPictureParameterBufferAV1 *p,
-                          uint32_t mi_cols, uint32_t mi_rows)
+                          uint32_t mi_cols, uint32_t mi_rows,
+                          unsigned tile_size_bytes)
 {
     const int sb_shift = p->seq_info_fields.fields.use_128x128_superblock ? 5 : 4;
     const int sb_size  = sb_shift + 2;
@@ -374,14 +385,11 @@ static void put_tile_info(struct dmd_bitwriter *bw,
     if (cols_log2 + rows_log2 > 0) {
         dmd_bw_put_bits(bw, p->context_update_tile_id,
                         (int)(cols_log2 + rows_log2));
-        /* tile_size_bytes_minus_1 = 1 (two bytes).  The VA-API tile offsets
-         * have exactly two-byte gaps (observed as tile[0] offset 2 and each
-         * following tile starting two bytes after the previous end); those
-         * gaps are the original tile_size fields.  Matching the source width
-         * keeps the reconstructed payload length unchanged and avoids
-         * needless expansion.  This width must match the tile_size_minus_1
-         * encoding in dmd_av1_build_frame(). */
-        dmd_bw_put_bits(bw, 1, 2);
+        if (tile_size_bytes < 1)
+            tile_size_bytes = 1;
+        if (tile_size_bytes > 4)
+            tile_size_bytes = 4;
+        dmd_bw_put_bits(bw, tile_size_bytes - 1, 2);
     }
 }
 
@@ -738,6 +746,7 @@ size_t dmd_av1_build_sequence_header(const void *pic_v,
 static void put_uncompressed_header(struct dmd_bitwriter *bwp,
                                     const VADecPictureParameterBufferAV1 *p,
                                     uint8_t refresh_frame_flags,
+                                    unsigned tile_size_bytes,
                                     int enable_restoration)
 {
     /* struct dmd_bitwriter is a value type: buf points to the caller's
@@ -976,7 +985,7 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
     const uint32_t mi_cols = 2 * ((width  + 7) >> 3);
     const uint32_t mi_rows = 2 * ((height + 7) >> 3);
 
-    put_tile_info(&bw, p, mi_cols, mi_rows);
+    put_tile_info(&bw, p, mi_cols, mi_rows, tile_size_bytes);
     put_quantization_params(&bw, p);
     put_segmentation_params(&bw, p, primary_ref_none);
 
@@ -1060,8 +1069,10 @@ static void put_uncompressed_header(struct dmd_bitwriter *bwp,
      * interpolation mode field earlier in the header. */
     if (!intra_only && !err_res) {
         const char *force_warp = getenv("DMD_AV1_FORCE_WARPED_MOTION");
-        const int force_pixel_warp = dmd_av1_pixel_1080(p) ||
-            dmd_av1_pixel_legacy_syntax(p);
+        /* The matrix coefficient alone is not enough to identify the Pixel
+         * C2 syntax variant: ordinary libaom BT.709 streams use the same
+         * value while retaining the descriptor's per-frame warp flag. */
+        const int force_pixel_warp = dmd_av1_pixel_1080(p);
         const int warp = (force_pixel_warp || (force_warp &&
             (!strcmp(force_warp, "1") || !strcmp(force_warp, "true") ||
              !strcmp(force_warp, "on")))) ? 1 :
@@ -1109,11 +1120,12 @@ static size_t build_frame_header_obu(const VADecPictureParameterBufferAV1 *p,
                                      unsigned char *body, size_t body_cap,
                                      size_t *body_len_out,
                                      uint8_t refresh_frame_flags,
+                                     unsigned tile_size_bytes,
                                      int enable_restoration)
 {
     struct dmd_bitwriter bw;
     dmd_bw_init(&bw, body, body_cap);
-    put_uncompressed_header(&bw, p, refresh_frame_flags,
+    put_uncompressed_header(&bw, p, refresh_frame_flags, tile_size_bytes,
                             enable_restoration);
 
     if (obu_type == DMD_OBU_FRAME)
@@ -1139,6 +1151,7 @@ size_t dmd_av1_build_frame_header(const void *pic_v,
     size_t body_len = 0;
     if (build_frame_header_obu(p, DMD_OBU_FRAME_HEADER,
                               body, sizeof(body), &body_len, 0xff,
+                              2,
                               enable_restoration) == 0)
         return 0;
 
@@ -1161,12 +1174,16 @@ size_t dmd_av1_build_frame(const void *pic_v,
     if (!p || !out || !tiles || num_tiles <= 0 || out_cap < 16)
         return 0;
 
+    const unsigned tile_size_bytes =
+        dmd_av1_tile_size_bytes(tiles, num_tiles);
+
     /* Frame header (ends with byte_alignment, not trailing_bits). */
     unsigned char fh[512];
     size_t fh_len = 0;
     if (build_frame_header_obu(p, DMD_OBU_FRAME,
                               fh, sizeof(fh), &fh_len,
                               refresh_frame_flags,
+                              tile_size_bytes,
                               enable_restoration) == 0)
         return 0;
     /* tile_group_obu() payload (specification 5.11.1):
@@ -1177,9 +1194,8 @@ size_t dmd_av1_build_frame(const void *pic_v,
      *   the final tile has no length field; its size is implied by the
      *   remaining OBU payload
      *
-     * tile_size_minus_1 uses le(2), and its width must match the
-     * tile_size_bytes_minus_1 = 1 written by tile_info; a mismatch misaligns
-     * every tile after the first. */
+     * tile_size_minus_1 uses the width signalled by tile_info; a mismatch
+     * misaligns every tile after the first. */
     const uint32_t tile_total =
         (uint32_t)p->tile_cols * (uint32_t)p->tile_rows;
     const char *prefix_visible = getenv("DMD_AV1_PREFIX_VISIBLE_TILE");
@@ -1210,7 +1226,7 @@ size_t dmd_av1_build_frame(const void *pic_v,
             return 0;
         payload_len += tiles[i].len;
         if (i + 1 < num_tiles)
-            payload_len += 2;         /* tile_size_minus_1, le(2) */
+            payload_len += tile_size_bytes; /* tile_size_minus_1 */
     }
 
     const size_t hdr = dmd_av1_obu_header(DMD_OBU_FRAME, payload_len,
@@ -1227,14 +1243,11 @@ size_t dmd_av1_build_frame(const void *pic_v,
         *q++ = 0;
     for (int i = 0; i < num_tiles; i++) {
         if (i + 1 < num_tiles) {
-            /* le(2): the width must equal tile_size_bytes_minus_1 + 1 = 2
-             * from the frame header.  This caps one tile at 64 KiB; observed
-             * 1080p tiles are about 4 KiB and the VA-API source stream also
-             * uses two bytes.  If a future stream exceeds 64 KiB, widen this
-             * field and the frame-header field together. */
-            const uint32_t v = (uint32_t)(tiles[i].len - 1);
-            *q++ = (unsigned char)(v & 0xFF);
-            *q++ = (unsigned char)((v >> 8) & 0xFF);
+            size_t v = tiles[i].len - 1;
+            for (unsigned byte = 0; byte < tile_size_bytes; byte++) {
+                *q++ = (unsigned char)(v & 0xFF);
+                v >>= 8;
+            }
         }
         for (size_t k = 0; k < tiles[i].len; k++)
             *q++ = tiles[i].data[k];
