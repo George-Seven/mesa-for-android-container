@@ -450,6 +450,7 @@ struct tva_fence {
     uint32_t magic;
     struct tva_codec *codec;
     struct tva_pending *slot;
+    bool queued;            /* codec bootstrap unit not submitted yet */
     bool failed;           /* the associated pending entry was abandoned */
 };
 
@@ -463,6 +464,24 @@ struct tva_fence {
 #define TVA_AV1_GROUP_MAX_FRAMES 64
 /* Keep surface reuse bounded even when MediaCodec is temporarily stalled. */
 #define TVA_FENCE_DESTROY_WAIT_MS 200
+#define TVA_HEVC_MAX_RPS 64
+#define TVA_HEVC_BOOTSTRAP_MAX_UNITS 32
+#define TVA_H264_BOOTSTRAP_MAX_UNITS 8
+
+struct tva_h265_rps {
+    bool valid;
+    uint8_t neg_count;
+    uint8_t pos_count;
+    uint32_t neg[8];
+    uint32_t pos[8];
+};
+
+struct tva_bootstrap_unit {
+    uint8_t *data;
+    size_t len;
+    struct pipe_resource *resources[2];
+    struct tva_fence *fence;
+};
 
 struct tva_av1_picture {
     struct pipe_video_buffer *target;
@@ -521,6 +540,17 @@ struct tva_codec {
     bool h264_pps_defaults_valid;
     unsigned h264_pps_l0_default;
     unsigned h264_pps_l1_default;
+    /* The VA HEVC picture descriptor omits max_sub_layers_minus1.  Keep the
+     * largest temporal id observed in the access units so synthesized VPS/SPS
+     * parameter sets accept streams which use temporal scalability. */
+    unsigned hevc_max_sub_layers;
+    struct tva_h265_rps hevc_rps[TVA_HEVC_MAX_RPS];
+    struct tva_bootstrap_unit hevc_bootstrap[TVA_HEVC_BOOTSTRAP_MAX_UNITS];
+    unsigned hevc_bootstrap_count;
+    bool hevc_bootstrap_done;
+    struct tva_bootstrap_unit h264_bootstrap[TVA_H264_BOOTSTRAP_MAX_UNITS];
+    unsigned h264_bootstrap_count;
+    bool h264_bootstrap_done;
     bool av1_sequence_sent;
     bool av1_enable_restoration;
     /* Some FFmpeg/libva AV1 streams omit reduced_tx_set_used on the
@@ -864,6 +894,182 @@ tva_pend_reserve_locked(struct tva_codec *c, uint32_t unit_seq,
     }
     c->pend_count++;
     return p;
+}
+
+static void tva_codec_destroy_fence(struct pipe_video_codec *codec,
+                                    struct pipe_fence_handle *fence_handle);
+
+static bool
+tva_hevc_rps_complete(const struct tva_codec *c, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++)
+        if (!c->hevc_rps[i].valid)
+            return false;
+    return true;
+}
+
+static void
+tva_bootstrap_release(struct tva_bootstrap_unit *unit)
+{
+    if (!unit)
+        return;
+    for (unsigned i = 0; i < ARRAY_SIZE(unit->resources); i++)
+        pipe_resource_reference(&unit->resources[i], NULL);
+    free(unit->data);
+    memset(unit, 0, sizeof(*unit));
+}
+
+static int
+tva_hevc_bootstrap_queue(struct tva_codec *c,
+                         struct pipe_video_buffer *target,
+                         struct pipe_picture_desc *picture)
+{
+    if (c->hevc_bootstrap_count >= ARRAY_SIZE(c->hevc_bootstrap))
+        return -1;
+    struct tva_bootstrap_unit *unit =
+        &c->hevc_bootstrap[c->hevc_bootstrap_count];
+    unit->data = malloc(c->acc_len);
+    if (!unit->data)
+        return -1;
+    memcpy(unit->data, c->acc, c->acc_len);
+    unit->len = c->acc_len;
+    if (target) {
+        struct pipe_resource *res[4] = {0};
+        target->get_resources(target, res);
+        for (unsigned i = 0; i < ARRAY_SIZE(unit->resources); i++)
+            if (res[i])
+                pipe_resource_reference(&unit->resources[i], res[i]);
+    }
+    unit->fence = CALLOC_STRUCT(tva_fence);
+    if (!unit->fence) {
+        tva_bootstrap_release(unit);
+        return -1;
+    }
+    unit->fence->magic = TVA_FENCE_MAGIC;
+    unit->fence->codec = c;
+    unit->fence->queued = true;
+    if (picture && picture->out_fence) {
+        if (*picture->out_fence)
+            tva_codec_destroy_fence(&c->base, *picture->out_fence);
+        *picture->out_fence = (struct pipe_fence_handle *)unit->fence;
+    }
+    c->hevc_bootstrap_count++;
+    return 0;
+}
+
+/* Submit the units collected while the SPS short-term RPS table was being
+ * reconstructed.  All fences are attached before the first unit is sent so a
+ * waiting VA client cannot observe an unsubmitted picture as complete. */
+static int
+tva_hevc_bootstrap_flush(struct tva_codec *c)
+{
+    for (unsigned i = 0; i < c->hevc_bootstrap_count; i++) {
+        struct tva_bootstrap_unit *unit = &c->hevc_bootstrap[i];
+        struct tva_fence *fence = unit->fence;
+        uint32_t seq = (uint32_t)c->next_unit + 1;
+        mtx_lock(&c->pend_mutex);
+        struct tva_pending *pending =
+            tva_pend_reserve_locked(c, seq, NULL, fence);
+        if (pending) {
+            for (unsigned p = 0; p < ARRAY_SIZE(pending->resources); p++)
+                if (unit->resources[p])
+                    pipe_resource_reference(&pending->resources[p],
+                                            unit->resources[p]);
+            if (fence)
+                fence->queued = false;
+            u_cnd_monotonic_broadcast(&c->pend_cond);
+        }
+        mtx_unlock(&c->pend_mutex);
+        if (!pending || tva_send_unit(c, unit->data, unit->len) != TVA_OK) {
+            if (fence)
+                fence->failed = true;
+            tva_bootstrap_release(unit);
+            for (unsigned j = i + 1; j < c->hevc_bootstrap_count; j++)
+                tva_bootstrap_release(&c->hevc_bootstrap[j]);
+            c->hevc_bootstrap_count = 0;
+            tva_mark_broken(c);
+            return -1;
+        }
+        c->next_unit++;
+        tva_bootstrap_release(unit);
+    }
+    c->hevc_bootstrap_count = 0;
+    return 0;
+}
+
+static int
+tva_h264_bootstrap_queue(struct tva_codec *c,
+                         struct pipe_video_buffer *target,
+                         struct pipe_picture_desc *picture)
+{
+    if (c->h264_bootstrap_count >= ARRAY_SIZE(c->h264_bootstrap))
+        return -1;
+    struct tva_bootstrap_unit *unit =
+        &c->h264_bootstrap[c->h264_bootstrap_count];
+    unit->data = malloc(c->acc_len);
+    if (!unit->data)
+        return -1;
+    memcpy(unit->data, c->acc, c->acc_len);
+    unit->len = c->acc_len;
+    if (target) {
+        struct pipe_resource *res[4] = {0};
+        target->get_resources(target, res);
+        for (unsigned i = 0; i < ARRAY_SIZE(unit->resources); i++)
+            if (res[i])
+                pipe_resource_reference(&unit->resources[i], res[i]);
+    }
+    unit->fence = CALLOC_STRUCT(tva_fence);
+    if (!unit->fence) {
+        tva_bootstrap_release(unit);
+        return -1;
+    }
+    unit->fence->magic = TVA_FENCE_MAGIC;
+    unit->fence->codec = c;
+    unit->fence->queued = true;
+    if (picture && picture->out_fence) {
+        if (*picture->out_fence)
+            tva_codec_destroy_fence(&c->base, *picture->out_fence);
+        *picture->out_fence = (struct pipe_fence_handle *)unit->fence;
+    }
+    c->h264_bootstrap_count++;
+    return 0;
+}
+
+static int
+tva_h264_bootstrap_flush(struct tva_codec *c)
+{
+    for (unsigned i = 0; i < c->h264_bootstrap_count; i++) {
+        struct tva_bootstrap_unit *unit = &c->h264_bootstrap[i];
+        struct tva_fence *fence = unit->fence;
+        uint32_t seq = (uint32_t)c->next_unit + 1;
+        mtx_lock(&c->pend_mutex);
+        struct tva_pending *pending =
+            tva_pend_reserve_locked(c, seq, NULL, fence);
+        if (pending) {
+            for (unsigned p = 0; p < ARRAY_SIZE(pending->resources); p++)
+                if (unit->resources[p])
+                    pipe_resource_reference(&pending->resources[p],
+                                            unit->resources[p]);
+            if (fence)
+                fence->queued = false;
+            u_cnd_monotonic_broadcast(&c->pend_cond);
+        }
+        mtx_unlock(&c->pend_mutex);
+        if (!pending || tva_send_unit(c, unit->data, unit->len) != TVA_OK) {
+            if (fence)
+                fence->failed = true;
+            tva_bootstrap_release(unit);
+            for (unsigned j = i + 1; j < c->h264_bootstrap_count; j++)
+                tva_bootstrap_release(&c->h264_bootstrap[j]);
+            c->h264_bootstrap_count = 0;
+            tva_mark_broken(c);
+            return -1;
+        }
+        c->next_unit++;
+        tva_bootstrap_release(unit);
+    }
+    c->h264_bootstrap_count = 0;
+    return 0;
 }
 
 /* AV1 show_existing_frame packets do not enter the VA decode callbacks.  A
@@ -1815,6 +2021,7 @@ tva_h264_high_profile(enum pipe_video_profile profile)
 static size_t
 tva_build_h264_sps(enum pipe_video_profile profile,
                    const struct pipe_h264_sps *sps, unsigned max_refs,
+                   unsigned level_idc,
                    unsigned visible_width, unsigned visible_height,
                    uint8_t **out)
 {
@@ -1861,7 +2068,8 @@ tva_build_h264_sps(enum pipe_video_profile profile,
     tva_bw_put(&w, 8, 0x67);             /* nal_ref_idc=3, type=7 */
     tva_bw_put(&w, 8, profile_idc);
     tva_bw_put(&w, 8, 0);                /* constraint flags + reserved */
-    tva_bw_put(&w, 8, sps->level_idc ? sps->level_idc : 40);
+    tva_bw_put(&w, 8, sps->level_idc ? sps->level_idc :
+                         (level_idc ? level_idc : 40));
     tva_bw_ue(&w, 0);                    /* seq_parameter_set_id */
     if (profile_idc == 100 || profile_idc == 110 ||
         profile_idc == 122 || profile_idc == 244) {
@@ -1923,13 +2131,10 @@ tva_build_h264_sps(enum pipe_video_profile profile,
         tva_bw_ue(&w, 0);                /* frame_crop_top_offset */
         tva_bw_ue(&w, crop_bottom);
     }
-    /* The VA picture descriptor does not carry the original VUI.  Emit only a
-     * minimal parameter block and, importantly, do not invent a bitstream
-     * restriction: the source stream may permit reordering (the test stream
-     * does), and Qualcomm C2 treats a fabricated max_num_reorder_frames=0 as
-     * a different stream, dropping output after its initial reorder window.
-     * The remaining VUI flags are left absent because their values are not
-     * represented by the VA descriptor. */
+    /* The VA picture descriptor does not carry the original VUI.  Keep the
+     * decoder's reorder window explicit: Qualcomm C2 otherwise assumes zero
+     * reordering and stops returning pictures from streams containing B
+     * frames after its initial output window. */
     tva_bw_put(&w, 1, 1);                /* vui_parameters_present */
     tva_bw_put(&w, 1, 0);                /* aspect_ratio_info_present */
     tva_bw_put(&w, 1, 0);                /* overscan_info_present */
@@ -1939,7 +2144,14 @@ tva_build_h264_sps(enum pipe_video_profile profile,
     tva_bw_put(&w, 1, 0);                /* nal_hrd_parameters_present */
     tva_bw_put(&w, 1, 0);                /* vcl_hrd_parameters_present */
     tva_bw_put(&w, 1, 0);                /* pic_struct_present */
-    tva_bw_put(&w, 1, 0);                /* bitstream_restriction_flag */
+    tva_bw_put(&w, 1, 1);                /* bitstream_restriction_flag */
+    tva_bw_put(&w, 1, 1);                /* motion_vectors_over_pic_boundaries */
+    tva_bw_ue(&w, 0);                    /* max_bytes_per_pic_denom */
+    tva_bw_ue(&w, 0);                    /* max_bits_per_mb_denom */
+    tva_bw_ue(&w, 11);                   /* log2_max_mv_length_horizontal */
+    tva_bw_ue(&w, 11);                   /* log2_max_mv_length_vertical */
+    tva_bw_ue(&w, max_refs > 2 ? 2 : 0); /* max_num_reorder_frames */
+    tva_bw_ue(&w, max_refs ? max_refs : 1); /* max_dec_frame_buffering */
     tva_bw_rbsp_trailing(&w);
     *out = w.buf;
     return w.len;
@@ -2025,6 +2237,44 @@ tva_h265_level_idc(unsigned width, unsigned height)
     return 180;                      /* 6.0 */
 }
 
+/* VA-API does not expose the per-layer HEVC reorder count.  A zero value is
+ * not a safe reconstruction for streams containing B pictures: Qualcomm's
+ * decoder then stops returning frames after its initial reorder window.  Use
+ * the decoded-picture-buffer limit as a conservative bound, capped at the
+ * largest reorder depth seen in the tested Pixel streams. */
+static unsigned
+tva_h265_reorder_pics(const struct pipe_h265_sps *sps)
+{
+    if (!sps || sps->no_pic_reordering_flag)
+        return 0;
+    return MIN2((unsigned)sps->sps_max_dec_pic_buffering_minus1, 3u);
+}
+
+static unsigned
+tva_h265_scan_max_sub_layers(const uint8_t *data, size_t len)
+{
+    unsigned max_sub_layers = 0;
+    size_t scan = 0;
+
+    while (scan < len) {
+        size_t sc = tva_next_start_code(data, len, scan);
+        if (sc >= len)
+            break;
+        size_t nal = sc + 3;
+        if (nal + 1 < len) {
+            unsigned nal_type = (data[nal] >> 1) & 0x3f;
+            if (nal_type <= 31) {
+                unsigned temporal_id_plus1 = data[nal + 1] & 7;
+                if (temporal_id_plus1 > 0)
+                    max_sub_layers = MAX2(max_sub_layers,
+                                          temporal_id_plus1 - 1);
+            }
+        }
+        scan = sc + 3;
+    }
+    return MIN2(max_sub_layers, 6u);
+}
+
 static void
 tva_bw_hevc_header(struct tva_bw *w, unsigned nal_type)
 {
@@ -2036,7 +2286,7 @@ tva_bw_hevc_header(struct tva_bw *w, unsigned nal_type)
 
 static void
 tva_h265_put_ptl(struct tva_bw *w, enum pipe_video_profile profile,
-                 unsigned width, unsigned height)
+                 unsigned width, unsigned height, unsigned max_sub_layers)
 {
     unsigned profile_idc = tva_h265_profile_idc(profile);
 
@@ -2053,11 +2303,18 @@ tva_h265_put_ptl(struct tva_bw *w, enum pipe_video_profile profile,
     tva_bw_put(w, 21, 0);                /* reserved_zero_43bits (part 2) */
     tva_bw_put(w, 1, 0);                 /* inbld/reserved_zero_bit */
     tva_bw_put(w, 8, tva_h265_level_idc(width, height));
+    for (unsigned i = 0; i < max_sub_layers; i++) {
+        tva_bw_put(w, 1, 0);              /* sub_layer_profile_present_flag */
+        tva_bw_put(w, 1, 0);              /* sub_layer_level_present_flag */
+    }
+    for (unsigned i = max_sub_layers; i < 8; i++)
+        tva_bw_put(w, 2, 0);              /* reserved_zero_2bits */
 }
 
 static size_t
 tva_build_h265_vps(const struct pipe_h265_sps *sps,
-                   enum pipe_video_profile profile, uint8_t **out)
+                   enum pipe_video_profile profile,
+                   unsigned max_sub_layers, uint8_t **out)
 {
     struct tva_bw w = {0};
 
@@ -2065,14 +2322,14 @@ tva_build_h265_vps(const struct pipe_h265_sps *sps,
     tva_bw_put(&w, 4, 0);                /* vps_video_parameter_set_id */
     tva_bw_put(&w, 2, 3);                /* base_layer_internal/available */
     tva_bw_put(&w, 6, 0);                /* vps_max_layers_minus1 */
-    tva_bw_put(&w, 3, 0);                /* vps_max_sub_layers_minus1 */
+    tva_bw_put(&w, 3, max_sub_layers);   /* vps_max_sub_layers_minus1 */
     tva_bw_put(&w, 1, 1);                /* vps_temporal_id_nesting_flag */
     tva_bw_put(&w, 16, 0xffff);          /* vps_reserved_0xffff_16bits */
     tva_h265_put_ptl(&w, profile, sps->pic_width_in_luma_samples,
-                     sps->pic_height_in_luma_samples);
+                     sps->pic_height_in_luma_samples, max_sub_layers);
     tva_bw_put(&w, 1, 0);                /* sub_layer_ordering_info_present */
     tva_bw_ue(&w, sps->sps_max_dec_pic_buffering_minus1);
-    tva_bw_ue(&w, 0);                    /* vps_max_num_reorder_pics */
+    tva_bw_ue(&w, tva_h265_reorder_pics(sps));
     tva_bw_ue(&w, 0);                    /* vps_max_latency_increase_plus1 */
     tva_bw_put(&w, 6, 0);                /* vps_max_layer_id */
     tva_bw_ue(&w, 0);                    /* vps_num_layer_sets_minus1 */
@@ -2083,18 +2340,206 @@ tva_build_h265_vps(const struct pipe_h265_sps *sps,
     return w.len;
 }
 
+#define TVA_HEVC_RPS_ENTRIES 16
+
+struct tva_h265_rps_wire {
+    bool inter;
+    int32_t delta_rps;
+    uint8_t ref_count;
+    bool ref_used[TVA_HEVC_RPS_ENTRIES];
+    bool ref_delta[TVA_HEVC_RPS_ENTRIES];
+    uint8_t neg_count;
+    uint8_t pos_count;
+    int32_t neg[TVA_HEVC_RPS_ENTRIES];
+    int32_t pos[TVA_HEVC_RPS_ENTRIES];
+};
+
+static bool
+tva_h265_rps_contains(const struct tva_h265_rps *rps, int32_t value)
+{
+    if (!rps || !rps->valid || !value)
+        return false;
+    if (value < 0) {
+        for (unsigned i = 0; i < rps->neg_count; i++)
+            if ((int32_t)rps->neg[i] == -value)
+                return true;
+    } else {
+        for (unsigned i = 0; i < rps->pos_count; i++)
+            if ((int32_t)rps->pos[i] == value)
+                return true;
+    }
+    return false;
+}
+
+static void
+tva_h265_wire_non_inter(struct tva_h265_rps_wire *wire,
+                        const struct tva_h265_rps *rps)
+{
+    memset(wire, 0, sizeof(*wire));
+    if (!rps || !rps->valid)
+        return;
+    wire->neg_count = MIN2(rps->neg_count, TVA_HEVC_RPS_ENTRIES);
+    wire->pos_count = MIN2(rps->pos_count, TVA_HEVC_RPS_ENTRIES);
+    for (unsigned i = 0; i < wire->neg_count; i++)
+        wire->neg[i] = -(int32_t)rps->neg[i];
+    for (unsigned i = 0; i < wire->pos_count; i++)
+        wire->pos[i] = (int32_t)rps->pos[i];
+}
+
+/* Reconstruct the syntax-order RPS prediction used by HEVC 7.4.8.1.  The
+ * public VA descriptor contains only used references; this chooses the
+ * compact prediction whose used entries are exactly the descriptor's set. */
+static bool
+tva_h265_wire_inter(struct tva_h265_rps_wire *wire,
+                    const struct tva_h265_rps *current,
+                    const struct tva_h265_rps_wire *prev)
+{
+    if (!wire || !current || !current->valid || !prev ||
+        prev->neg_count + prev->pos_count >= TVA_HEVC_RPS_ENTRIES)
+        return false;
+
+    const unsigned ref_count = prev->neg_count + prev->pos_count;
+    for (int delta = -64; delta <= 64; delta++) {
+        if (!delta)
+            continue;
+        struct tva_h265_rps_wire candidate = {0};
+        candidate.inter = true;
+        candidate.delta_rps = delta;
+        candidate.ref_count = ref_count + 1;
+
+        int32_t refs[TVA_HEVC_RPS_ENTRIES];
+        for (unsigned i = 0; i < prev->neg_count; i++)
+            refs[i] = prev->neg[i] + delta;
+        for (unsigned i = 0; i < prev->pos_count; i++)
+            refs[prev->neg_count + i] = prev->pos[i] + delta;
+        refs[ref_count] = delta;
+
+        unsigned used_count = 0;
+        for (unsigned i = 0; i < candidate.ref_count; i++) {
+            bool used = tva_h265_rps_contains(current, refs[i]);
+            candidate.ref_used[i] = used;
+            candidate.ref_delta[i] = used;
+            used_count += used;
+        }
+        if (used_count != current->neg_count + current->pos_count)
+            continue;
+
+        for (int i = (int)prev->pos_count - 1; i >= 0; i--) {
+            unsigned ref = prev->neg_count + (unsigned)i;
+            if (refs[ref] < 0 && candidate.ref_delta[ref])
+                candidate.neg[candidate.neg_count++] = refs[ref];
+        }
+        if (delta < 0 && candidate.ref_delta[ref_count])
+            candidate.neg[candidate.neg_count++] = delta;
+        for (unsigned i = 0; i < prev->neg_count; i++) {
+            if (refs[i] < 0 && candidate.ref_delta[i])
+                candidate.neg[candidate.neg_count++] = refs[i];
+        }
+        for (int i = (int)prev->neg_count - 1; i >= 0; i--) {
+            if (refs[(unsigned)i] > 0 && candidate.ref_delta[(unsigned)i])
+                candidate.pos[candidate.pos_count++] = refs[(unsigned)i];
+        }
+        if (delta > 0 && candidate.ref_delta[ref_count])
+            candidate.pos[candidate.pos_count++] = delta;
+        for (unsigned i = 0; i < prev->pos_count; i++) {
+            unsigned ref = prev->neg_count + i;
+            if (refs[ref] > 0 && candidate.ref_delta[ref])
+                candidate.pos[candidate.pos_count++] = refs[ref];
+        }
+
+        if (candidate.neg_count != current->neg_count ||
+            candidate.pos_count != current->pos_count)
+            continue;
+        bool match = true;
+        for (unsigned i = 0; i < current->neg_count; i++)
+            match &= candidate.neg[i] == -(int32_t)current->neg[i];
+        for (unsigned i = 0; i < current->pos_count; i++)
+            match &= candidate.pos[i] == (int32_t)current->pos[i];
+        if (match) {
+            *wire = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+tva_h265_put_wire_rps(struct tva_bw *w,
+                      const struct tva_h265_rps_wire *wire,
+                      unsigned index)
+{
+    if (index)
+        tva_bw_put(w, 1, wire && wire->inter);
+    if (!wire || !wire->inter) {
+        tva_bw_ue(w, wire ? wire->neg_count : 0);
+        tva_bw_ue(w, wire ? wire->pos_count : 0);
+        if (!wire)
+            return;
+        for (unsigned i = 0; i < wire->neg_count; i++) {
+            unsigned prev = i ? (unsigned)(-wire->neg[i - 1]) : 0;
+            tva_bw_ue(w, (unsigned)(-wire->neg[i] - prev - 1));
+            tva_bw_put(w, 1, 1);
+        }
+        for (unsigned i = 0; i < wire->pos_count; i++) {
+            unsigned prev = i ? (unsigned)wire->pos[i - 1] : 0;
+            tva_bw_ue(w, (unsigned)(wire->pos[i] - prev - 1));
+            tva_bw_put(w, 1, 1);
+        }
+        return;
+    }
+
+    tva_bw_put(w, 1, wire->delta_rps < 0);
+    tva_bw_ue(w, (unsigned)(abs(wire->delta_rps) - 1));
+    for (unsigned i = 0; i < wire->ref_count; i++) {
+        tva_bw_put(w, 1, wire->ref_used[i]);
+        if (!wire->ref_used[i])
+            tva_bw_put(w, 1, wire->ref_delta[i]);
+    }
+}
+
+static bool
+tva_h265_update_rps(struct tva_h265_rps *dst,
+                    const struct pipe_h265_picture_desc *pic)
+{
+    struct tva_h265_rps next = {0};
+    if (!pic)
+        return false;
+    for (unsigned i = 0; i < pic->NumPocStCurrBefore && next.neg_count < 8; i++) {
+        unsigned idx = pic->RefPicSetStCurrBefore[i];
+        if (idx >= 15 || pic->PicOrderCntVal[idx] >= pic->CurrPicOrderCntVal)
+            continue;
+        next.neg[next.neg_count++] =
+            (uint32_t)(pic->CurrPicOrderCntVal - pic->PicOrderCntVal[idx]);
+    }
+    for (unsigned i = 0; i < pic->NumPocStCurrAfter && next.pos_count < 8; i++) {
+        unsigned idx = pic->RefPicSetStCurrAfter[i];
+        if (idx >= 15 || pic->PicOrderCntVal[idx] <= pic->CurrPicOrderCntVal)
+            continue;
+        next.pos[next.pos_count++] =
+            (uint32_t)(pic->PicOrderCntVal[idx] - pic->CurrPicOrderCntVal);
+    }
+    next.valid = true;
+    if (!memcmp(dst, &next, sizeof(next)))
+        return false;
+    *dst = next;
+    return true;
+}
+
 static size_t
 tva_build_h265_sps(const struct pipe_h265_sps *sps,
-                   enum pipe_video_profile profile, uint8_t **out)
+                   enum pipe_video_profile profile,
+                   unsigned max_sub_layers,
+                   const struct tva_h265_rps *rps,
+                   uint8_t **out)
 {
     struct tva_bw w = {0};
 
     tva_bw_hevc_header(&w, 33);
     tva_bw_put(&w, 4, 0);                /* sps_video_parameter_set_id */
-    tva_bw_put(&w, 3, 0);                /* sps_max_sub_layers_minus1 */
+    tva_bw_put(&w, 3, max_sub_layers);   /* sps_max_sub_layers_minus1 */
     tva_bw_put(&w, 1, 1);                /* sps_temporal_id_nesting_flag */
     tva_h265_put_ptl(&w, profile, sps->pic_width_in_luma_samples,
-                     sps->pic_height_in_luma_samples);
+                     sps->pic_height_in_luma_samples, max_sub_layers);
     tva_bw_ue(&w, 0);                    /* sps_seq_parameter_set_id */
     tva_bw_ue(&w, sps->chroma_format_idc);
     if (sps->chroma_format_idc == 3)
@@ -2107,7 +2552,7 @@ tva_build_h265_sps(const struct pipe_h265_sps *sps,
     tva_bw_ue(&w, sps->log2_max_pic_order_cnt_lsb_minus4);
     tva_bw_put(&w, 1, 0);                /* sub_layer_ordering_info_present */
     tva_bw_ue(&w, sps->sps_max_dec_pic_buffering_minus1);
-    tva_bw_ue(&w, 0);                    /* sps_max_num_reorder_pics */
+    tva_bw_ue(&w, tva_h265_reorder_pics(sps));
     tva_bw_ue(&w, 0);                    /* sps_max_latency_increase_plus1 */
     tva_bw_ue(&w, sps->log2_min_luma_coding_block_size_minus3);
     tva_bw_ue(&w, sps->log2_diff_max_min_luma_coding_block_size);
@@ -2128,17 +2573,18 @@ tva_build_h265_sps(const struct pipe_h265_sps *sps,
         tva_bw_ue(&w, sps->log2_diff_max_min_luma_coding_block_size);
         tva_bw_put(&w, 1, sps->pcm_loop_filter_disabled_flag);
     }
-    /* Keep the count from VA-API.  Its descriptor does not carry the RPS
-     * contents, so emit empty non-predicted sets as placeholders.  The tested
-     * Qualcomm decoder requires a non-zero count even for inline slice RPS.
-     * tva_h265_can_build() rejects streams whose slices reference these
-     * placeholders through short_term_ref_pic_set_sps_flag. */
+    /* VA-API exposes the current picture's RPS flags and POC values, but not
+     * the SPS RPS table.  Repeat the current RPS in every table entry so the
+     * slice's SPS index still selects the references needed for this picture.
+     * The CSD is refreshed when the RPS changes. */
+    struct tva_h265_rps_wire wire[TVA_HEVC_MAX_RPS] = {0};
     tva_bw_ue(&w, sps->num_short_term_ref_pic_sets);
     for (unsigned i = 0; i < sps->num_short_term_ref_pic_sets; i++) {
-        if (i)
-            tva_bw_put(&w, 1, 0);         /* inter_ref_pic_set_prediction */
-        tva_bw_ue(&w, 0);                /* num_negative_pics */
-        tva_bw_ue(&w, 0);                /* num_positive_pics */
+        const struct tva_h265_rps *cur = rps ? &rps[i] : NULL;
+        if (!tva_h265_wire_inter(&wire[i], cur,
+                                 i ? &wire[i - 1] : NULL))
+            tva_h265_wire_non_inter(&wire[i], cur);
+        tva_h265_put_wire_rps(&w, &wire[i], i);
     }
     tva_bw_put(&w, 1, sps->long_term_ref_pics_present_flag);
     if (sps->long_term_ref_pics_present_flag)
@@ -2229,15 +2675,6 @@ tva_h265_can_build(const struct pipe_h265_sps *sps,
                    const struct pipe_h265_picture_desc *pic)
 {
     if (!sps || !pic)
-        return false;
-    /* VA-API exposes only the number of short-term RPS entries, not their
-     * contents.  The slice header bit count is non-zero when the current
-     * picture carries an inline RPS (st_rps_bits in VAPictureParameterBuffer
-     * HEVC).  An IDR picture has no RPS syntax, so it is also safe to seed the
-     * synthetic SPS there.  If a later picture references an SPS RPS, the
-     * synthetic SPS cannot represent it and must be rejected. */
-    if (sps->num_short_term_ref_pic_sets > 0 &&
-        !pic->IDRPicFlag && pic->NumShortTermPictureSliceHeaderBits == 0)
         return false;
     /* Long-term SPS entries have the same limitation. */
     if (sps->long_term_ref_pics_present_flag &&
@@ -3306,6 +3743,8 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
     int codec_id = tva_codec_id(c->base.profile);
     enum pipe_video_format format = u_reduce_video_profile(c->base.profile);
     struct tva_pending *pending = NULL;
+    bool hevc_hold = false;
+    bool h264_hold = false;
     TVA_TRACE("end_frame enter acc=%zu profile=%d format=%d", c->acc_len,
               (int)c->base.profile, (int)format);
     uint32_t last_vcl = 0;
@@ -3320,18 +3759,31 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
             struct pipe_h264_picture_desc *h264 =
                 (struct pipe_h264_picture_desc *)picture;
             if (h264 && h264->pps && h264->pps->sps) {
+                if (!c->h264_bootstrap_done &&
+                    c->base.max_references >= 5) {
+                    if (h264->num_ref_idx_l0_active_minus1 >=
+                            c->base.max_references - 1 ||
+                        c->h264_bootstrap_count + 1 >=
+                            ARRAY_SIZE(c->h264_bootstrap)) {
+                        c->h264_bootstrap_done = true;
+                    } else {
+                        h264_hold = true;
+                    }
+                } else {
+                    c->h264_bootstrap_done = true;
+                }
+                if (h264_hold)
+                    goto h264_csd_done;
                 uint8_t *sps_rbsp = NULL, *pps_rbsp = NULL;
                 static const uint8_t sc[4] = { 0, 0, 0, 1 };
                 if (!c->h264_pps_defaults_valid) {
                     /* VA-API does not preserve the slice override flag, so
-                     * the per-picture list lengths cannot be used as PPS
-                     * defaults.  The DPB size is also not the same thing as
-                     * the PPS active-list defaults: Bilibili and Chromium
-                     * streams commonly use two L0 references and no L1
-                     * references while advertising a larger DPB.  Keep a
-                     * conservative, stable default instead of emitting a
-                     * six-reference PPS that Qualcomm MediaCodec rejects
-                     * when a slice relies on the original PPS default. */
+                     * the per-picture list lengths cannot generally be used
+                     * as PPS defaults.  Qualcomm's decoder accepts the
+                     * stable three-reference fallback used by the common
+                     * four-reference streams, while streams exposing five or
+                     * more DPB references may rely on the full L0 default in
+                     * slices without an override. */
                     unsigned default_l0 = c->base.max_references
                                           ? MIN2(c->base.max_references, 3) - 1
                                           : 0;
@@ -3339,11 +3791,26 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
                     c->h264_pps_l1_default = 0;
                     c->h264_pps_defaults_valid = true;
                 }
+                /* A stream with a larger DPB can still use the full L0 list
+                 * as its PPS default.  VA-API exposes only the effective list
+                 * size for each slice, so promote the stable fallback only
+                 * after a slice demonstrates the complete configured DPB.
+                 * This keeps streams such as Bilibili's seven-reference SPS
+                 * with a two-reference PPS default unchanged while allowing
+                 * the five-reference vertical AVC stream to select its
+                 * five-entry default before subsequent no-override slices. */
+                if (c->base.max_references >= 5 &&
+                    h264->num_ref_idx_l0_active_minus1 >=
+                    c->base.max_references - 1 &&
+                    c->h264_pps_l0_default < c->base.max_references - 1) {
+                    c->h264_pps_l0_default = c->base.max_references - 1;
+                }
                 size_t sps_rbsp_len = tva_build_h264_sps(c->base.profile,
                                                          h264->pps->sps,
                                                          c->base.max_references,
-                                                         target ? target->width : c->base.width,
-                                                         target ? target->height : c->base.height,
+                                                         c->base.level,
+                                                         c->base.width,
+                                                         c->base.height,
                                                          &sps_rbsp);
                 size_t pps_rbsp_len = tva_build_h264_pps(c->base.profile,
                                                          h264->pps,
@@ -3410,6 +3877,7 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
                 free(sps_buf);
                 free(pps_buf);
             }
+h264_csd_done:
             if (tva_codec_is_broken(c))
                 return -1;
         } else if (format == PIPE_VIDEO_FORMAT_HEVC) {
@@ -3421,6 +3889,16 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
                 uint8_t *vps_nalu = NULL, *sps_nalu = NULL;
                 uint8_t *pps_nalu = NULL;
 
+                /* The first access unit is normally an IDR/base-layer frame,
+                 * so it can hide a higher temporal layer used by later
+                 * pictures.  Seed the synthetic parameter sets with one
+                 * sub-layer; this is valid for single-layer streams and avoids
+                 * changing VPS/SPS after MediaCodec has started. */
+                c->hevc_max_sub_layers = MAX2(
+                    c->hevc_max_sub_layers,
+                    MAX2(1u, tva_h265_scan_max_sub_layers(c->acc,
+                                                            c->acc_len)));
+
                 if (!tva_h265_can_build(sps, h265)) {
                     debug_printf("tva: HEVC parameter sets cannot be synthesized "
                                  "for this stream\n");
@@ -3428,10 +3906,30 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
                     return -1;
                 }
 
+                unsigned rps_count = MIN2((unsigned)sps->num_short_term_ref_pic_sets,
+                                          (unsigned)TVA_HEVC_MAX_RPS);
+                if (h265->CurrRpsIdx < rps_count)
+                    tva_h265_update_rps(&c->hevc_rps[h265->CurrRpsIdx], h265);
+
+                hevc_hold = !c->hevc_bootstrap_done && rps_count > 0;
+                if (hevc_hold &&
+                    (tva_hevc_rps_complete(c, rps_count) ||
+                     c->hevc_bootstrap_count + 1 >=
+                        ARRAY_SIZE(c->hevc_bootstrap))) {
+                    c->hevc_bootstrap_done = true;
+                    hevc_hold = false;
+                }
+
+                if (hevc_hold)
+                    goto hevc_csd_done;
+
                 size_t vps_nalu_len =
-                    tva_build_h265_vps(sps, c->base.profile, &vps_nalu);
+                    tva_build_h265_vps(sps, c->base.profile,
+                                       c->hevc_max_sub_layers, &vps_nalu);
                 size_t sps_nalu_len =
-                    tva_build_h265_sps(sps, c->base.profile, &sps_nalu);
+                    tva_build_h265_sps(sps, c->base.profile,
+                                       c->hevc_max_sub_layers,
+                                       c->hevc_rps, &sps_nalu);
                 size_t pps_nalu_len = tva_build_h265_pps(h265->pps, &pps_nalu);
                 if (!vps_nalu_len || !sps_nalu_len || !pps_nalu_len) {
                     debug_printf("tva: HEVC CSD synthesis failed\n");
@@ -3482,10 +3980,6 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
                         debug_printf("tva: HEVC CSD send failed: %s\n",
                                      tva_session_last_error(c->sess));
                         tva_mark_broken(c);
-                    } else {
-                        TVA_TRACE("HEVC CSD sent: profile=%d vps=%zu sps=%zu pps=%zu",
-                                  (int)c->base.profile, vps_len, sps_len,
-                                  pps_len);
                     }
                 }
                 free(csd);
@@ -3493,6 +3987,7 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
                 free(sps_nalu);
                 free(pps_nalu);
             }
+hevc_csd_done:
             if (tva_codec_is_broken(c))
                 return -1;
         }
@@ -3528,6 +4023,21 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
             tva_mark_broken(c);
             return -1;
         }
+        /* The bootstrap queue is submitted immediately before the first
+         * live picture.  It advances next_unit for every queued access unit,
+         * so compute the live picture's sequence number only after that
+         * flush.  Computing it before the flush binds the fence to unit 1
+         * while MediaCodec returns the live frame as unit N+1. */
+        if (format == PIPE_VIDEO_FORMAT_HEVC &&
+            c->hevc_bootstrap_done && c->hevc_bootstrap_count) {
+            if (tva_hevc_bootstrap_flush(c) != 0)
+                return -1;
+        }
+        if (format == PIPE_VIDEO_FORMAT_MPEG4_AVC &&
+            c->h264_bootstrap_done && c->h264_bootstrap_count) {
+            if (tva_h264_bootstrap_flush(c) != 0)
+                return -1;
+        }
         uint32_t picture_unit = have_vcl ? (uint32_t)c->next_unit + 1
                                          : (uint32_t)c->next_unit;
         if (c->acc_len > MAX_FRAME) {
@@ -3536,6 +4046,18 @@ tva_codec_end_frame(struct pipe_video_codec *codec,
             c->acc_len = 0;
             tva_mark_broken(c);
             return -1;
+        }
+        if (have_vcl && (hevc_hold || h264_hold)) {
+            int queue_ret = format == PIPE_VIDEO_FORMAT_HEVC
+                ? tva_hevc_bootstrap_queue(c, target, picture)
+                : tva_h264_bootstrap_queue(c, target, picture);
+            if (queue_ret != 0) {
+                c->acc_len = 0;
+                tva_mark_broken(c);
+                return -1;
+            }
+            c->acc_len = 0;
+            return 0;
         }
         if (have_vcl) {
             if (picture_unit == 0) {
@@ -3918,6 +4440,27 @@ tva_codec_fence_wait(struct pipe_video_codec *codec,
                      PIPE_VIDEO_FORMAT_AV1;
 
     mtx_lock(&c->pend_mutex);
+    while (fence->queued && !c->broken) {
+        if (!infinite && timeout == 0) {
+            mtx_unlock(&c->pend_mutex);
+            return 0;
+        }
+        uint64_t now = os_time_get_nano();
+        if (!infinite && now >= deadline_ns) {
+            mtx_unlock(&c->pend_mutex);
+            return 0;
+        }
+        uint64_t wake_ns = infinite ? now + 200000000ull :
+                           MIN2(deadline_ns, now + 200000000ull);
+        struct timespec ts;
+        timespec_from_nsec(&ts, wake_ns);
+        u_cnd_monotonic_timedwait(&c->pend_cond, &c->pend_mutex, &ts);
+    }
+    if (fence->queued) {
+        fence->failed = true;
+        mtx_unlock(&c->pend_mutex);
+        return 0;
+    }
     if (fence->failed) {
         mtx_unlock(&c->pend_mutex);
         return 0;
@@ -4028,6 +4571,22 @@ tva_codec_destroy_fence(struct pipe_video_codec *codec,
     if (!fence)
         return;
     mtx_lock(&c->pend_mutex);
+    if (fence->queued && !fence->slot) {
+        for (unsigned i = 0; i < c->hevc_bootstrap_count; i++) {
+            if (c->hevc_bootstrap[i].fence == fence) {
+                c->hevc_bootstrap[i].fence = NULL;
+                break;
+            }
+        }
+        for (unsigned i = 0; i < c->h264_bootstrap_count; i++) {
+            if (c->h264_bootstrap[i].fence == fence) {
+                c->h264_bootstrap[i].fence = NULL;
+                break;
+            }
+        }
+        fence->queued = false;
+        u_cnd_monotonic_broadcast(&c->pend_cond);
+    }
     /* Chromium destroys a surface fence immediately before reusing the VA
      * surface for another picture.  Do not let a reordered daemon output
      * arrive after that reuse: it would overwrite the newer picture and make
@@ -4099,6 +4658,22 @@ tva_codec_destroy(struct pipe_video_codec *codec)
     while (c->pend_count)
         tva_pend_pop_locked(c);
     mtx_unlock(&c->pend_mutex);
+    for (unsigned i = 0; i < c->hevc_bootstrap_count; i++) {
+        if (c->hevc_bootstrap[i].fence) {
+            c->hevc_bootstrap[i].fence->queued = false;
+            c->hevc_bootstrap[i].fence->failed = true;
+        }
+        tva_bootstrap_release(&c->hevc_bootstrap[i]);
+    }
+    c->hevc_bootstrap_count = 0;
+    for (unsigned i = 0; i < c->h264_bootstrap_count; i++) {
+        if (c->h264_bootstrap[i].fence) {
+            c->h264_bootstrap[i].fence->queued = false;
+            c->h264_bootstrap[i].fence->failed = true;
+        }
+        tva_bootstrap_release(&c->h264_bootstrap[i]);
+    }
+    c->h264_bootstrap_count = 0;
     tva_av1_pending_clear(&c->av1_pending);
     mtx_destroy(&c->io_mutex);
     mtx_destroy(&c->av1_mutex);
@@ -4139,9 +4714,12 @@ tva_bridge_finish_decode(struct pipe_video_codec *codec)
     /* EOS releases MediaCodec's reordered tail. No reference chain is needed
      * after context destruction, so a reversible drain is safe here. Reader
      * staging and all Gallium copies remain on their original threads. */
-    if (drain && tva_session_drain(c->sess) != TVA_OK) {
+    if (drain) {
+        int drain_ret = tva_session_drain(c->sess);
+        if (drain_ret != TVA_OK) {
         tva_mark_broken(c);
         return;
+        }
     }
     const uint64_t deadline = os_time_get_nano() + 5000000000ull;
     for (unsigned i = 0; i < count; i++) {
@@ -4300,8 +4878,10 @@ tva_pipe_create_video_codec(struct pipe_context *context,
         FREE(c);
         return NULL;
     }
-    if (!encoder && thrd_create(&c->reader, tva_reader_thread, c) == thrd_success)
-        c->reader_started = true;
+    if (!encoder) {
+        int tr = thrd_create(&c->reader, tva_reader_thread, c);
+        c->reader_started = tr == thrd_success;
+    }
 
     c->base.context = context;
     c->base.profile = templat->profile;
