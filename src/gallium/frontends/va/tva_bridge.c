@@ -577,6 +577,7 @@ struct tva_codec {
     thrd_t reader;
     bool reader_started;
     bool av1_drain_sent;
+    bool reorder_drain_sent;
 };
 
 static struct tva_codec *
@@ -1137,6 +1138,26 @@ static unsigned
 tva_av1_drain_idle_ms(void)
 {
     const char *e = getenv("DMD_AV1_DRAIN_IDLE_MS");
+    if (!e || !*e)
+        return 5000;
+
+    char *end = NULL;
+    unsigned long value = strtoul(e, &end, 10);
+    if (end == e || *end || value < 100 || value > 60000)
+        return 5000;
+    return (unsigned)value;
+}
+
+/* Some Android decoders keep one reordered H.264/HEVC picture until they
+ * receive EOS.  VA-API has no decoder-flush callback, so a terminal fence can
+ * otherwise wait forever after the application has submitted the last
+ * picture.  Keep the fallback conservative and independently configurable;
+ * it is only used for the newest pending unit after the reader has gone
+ * idle. */
+static unsigned
+tva_reorder_drain_idle_ms(void)
+{
+    const char *e = getenv("DMD_REORDER_DRAIN_IDLE_MS");
     if (!e || !*e)
         return 5000;
 
@@ -4473,6 +4494,7 @@ tva_codec_fence_wait(struct pipe_video_codec *codec,
     p->waiters++;
     const uint64_t wait_start_ns = os_time_get_nano();
     const uint64_t drain_after_ns = (uint64_t)tva_av1_drain_idle_ms() * 1000000ull;
+    uint64_t reorder_drain_start_ns = 0;
     while (!p->ready) {
         if (!infinite && timeout == 0) {
             ret = 0;
@@ -4535,6 +4557,57 @@ tva_codec_fence_wait(struct pipe_video_codec *codec,
                 break;
             }
             continue;
+        }
+
+        /* H.264 and HEVC decoders can retain a terminal reordered picture
+         * even after the last access unit has been submitted.  There is no
+         * VA-API flush operation for the frontend to call, so release the
+         * tail through the daemon's reversible EOS/flush request when the
+         * newest pending unit has been idle for the conservative interval.
+         * Do not drain an older unit while the stream is still advancing:
+         * flushing destroys the reference chain and would corrupt normal
+         * playback. */
+        const enum pipe_video_format format =
+            u_reduce_video_profile(c->base.profile);
+        const bool reordered = format == PIPE_VIDEO_FORMAT_MPEG4_AVC ||
+                               format == PIPE_VIDEO_FORMAT_HEVC;
+        const uint64_t reorder_idle_ns =
+            (uint64_t)tva_reorder_drain_idle_ms() * 1000000ull;
+        if (reordered && p->unit_seq + 1 >= c->next_unit &&
+            now - wait_start_ns >= reorder_idle_ns) {
+            if (!c->reorder_drain_sent) {
+                c->reorder_drain_sent = true;
+                TVA_TRACE("terminal reordered fence unit=%u idle=%.3f ms; "
+                          "sending drain", p->unit_seq,
+                          (double)(now - wait_start_ns) / 1000000.0);
+                mtx_unlock(&c->pend_mutex);
+                int drain_ret = tva_send_drain(c);
+                mtx_lock(&c->pend_mutex);
+                if (drain_ret != TVA_OK) {
+                    TVA_TRACE("terminal reordered drain failed: %d", drain_ret);
+                    p->ready = true;
+                    p->failed = true;
+                    u_cnd_monotonic_broadcast(&c->pend_cond);
+                    ret = 0;
+                    break;
+                }
+                reorder_drain_start_ns = os_time_get_nano();
+                continue;
+            }
+
+            /* A compliant decoder should release the tail promptly after
+             * EOS.  If it still has no matching output after another idle
+             * interval, abandon only this terminal fence so context teardown
+             * cannot deadlock forever on a vendor-dropped picture. */
+            if (now - reorder_drain_start_ns >= reorder_idle_ns) {
+                TVA_TRACE("terminal reordered fence unit=%u still not ready "
+                          "after drain; abandoning", p->unit_seq);
+                p->ready = true;
+                p->failed = true;
+                u_cnd_monotonic_broadcast(&c->pend_cond);
+                ret = 0;
+                break;
+            }
         }
         uint64_t wake_ns = infinite ? now + 200000000ull :
                            MIN2(deadline_ns, now + 200000000ull);
