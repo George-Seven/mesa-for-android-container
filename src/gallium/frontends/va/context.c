@@ -136,7 +136,7 @@ VA_DRIVER_INIT_FUNC(VADriverContextP ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
    //fprintf(stderr, "tva-va: driver init display_type=%lu\n",
-           (unsigned long)ctx->display_type);
+   //        (unsigned long)ctx->display_type);
 
    drv = CALLOC(1, sizeof(vlVaDriver));
    if (!drv)
