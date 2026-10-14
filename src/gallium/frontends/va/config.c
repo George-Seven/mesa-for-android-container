@@ -48,7 +48,7 @@ vlVaQueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list, int *num_
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: query profiles\n");
+   //fprintf(stderr, "tva-va: query profiles\n");
 
    *num_profiles = 0;
 
@@ -79,7 +79,7 @@ vlVaQueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: query entrypoints profile=%d\n", profile);
+   //fprintf(stderr, "tva-va: query entrypoints profile=%d\n", profile);
 
    *num_entrypoints = 0;
 
@@ -624,7 +624,7 @@ vlVaCreateConfig(VADriverContextP ctx, VAProfile profile, VAEntrypoint entrypoin
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: create config profile=%d entrypoint=%d attrs=%d\n",
+   //fprintf(stderr, "tva-va: create config profile=%d entrypoint=%d attrs=%d\n",
            profile, entrypoint, num_attribs);
 
    drv = VL_VA_DRIVER(ctx);
@@ -799,7 +799,7 @@ vlVaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id, VAProfile 
    vlVaDriver *drv;
    vlVaConfig *config;
 
-   fprintf(stderr, "tva-va: query config attrs config=%u list=%p count=%d\n",
+   //fprintf(stderr, "tva-va: query config attrs config=%u list=%p count=%d\n",
            config_id, (void *)attrib_list, num_attribs ? *num_attribs : 0);
 
    if (!ctx)
@@ -839,8 +839,8 @@ vlVaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id, VAProfile 
                                                              config->profile,
                                                              config->entrypoint);
 
-   fprintf(stderr, "tva-va: query config attrs success profile=%d entrypoint=%d rt=%#x count=%d\n",
-           *profile, *entrypoint, attrib_list[0].value, *num_attribs);
+   //fprintf(stderr, "tva-va: query config attrs success profile=%d entrypoint=%d rt=%#x count=%d\n",
+   //        *profile, *entrypoint, attrib_list[0].value, *num_attribs);
 
    return VA_STATUS_SUCCESS;
 }
