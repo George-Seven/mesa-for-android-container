@@ -884,9 +884,9 @@ int tva_session_send_raw_frame(struct tva_session *s, const void *data,
         return TVA_ERR_INVAL;
     if (!data || len == 0)
         return sess_err(s, TVA_ERR_INVAL, "empty raw frame", 0);
-    if (len > TVA_MAX_UNIT_BYTES)
+    if (len > TVA_MAX_RAW_FRAME_BYTES)
         return sess_err(s, TVA_ERR_TOOBIG,
-                        "raw frame exceeds the daemon's 8MB cap", 0);
+                        "raw frame exceeds the daemon's 16MB cap", 0);
     if (s->fd < 0)
         return sess_err(s, TVA_ERR_STATE, "session has no live connection", 0);
     if (s->tx_broken)

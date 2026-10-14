@@ -81,8 +81,10 @@ enum {
 
 /* Uplink unit cap (MAX_FRAME; the daemon rejects anything larger). */
 #define TVA_MAX_UNIT_BYTES (8u * 1024u * 1024u)
+/* Encoder raw NV12 input cap (MAX_ENCODE_FRAME). */
+#define TVA_MAX_RAW_FRAME_BYTES (16u * 1024u * 1024u)
 /* Rational cap of a downlink frame.  MUST be far above TVA_MAX_UNIT_BYTES:
- * a single 4K NV12 frame is 12441600 bytes; the 8MB cap only bounds uplink. */
+ * a single 4K NV12 frame is 12441600 bytes; decoder units are capped at 8MB. */
 #define TVA_MAX_FRAME_BYTES (64u * 1024u * 1024u)
 
 /* Default connect / io timeouts (ms). */

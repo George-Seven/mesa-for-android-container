@@ -49,6 +49,7 @@
  * index; frames with unknown indices fall back to FIFO matching.
  */
 #include "tva_bridge.h"
+#include "va_private.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -510,6 +511,8 @@ struct tva_codec {
     uint32_t encode_bitrate;
     uint32_t encode_fps_num;
     uint32_t encode_fps_den;
+    uint32_t encode_width;
+    uint32_t encode_height;
     uint8_t *encode_packet;
     size_t encode_packet_cap;
 
@@ -2722,10 +2725,11 @@ tva_encode_copy_source(struct tva_codec *c, struct pipe_video_buffer *source,
         source->buffer_format != PIPE_FORMAT_NV12)
         return -1;
 
-    unsigned width = source->width;
-    unsigned height = source->height;
+    unsigned width = c->encode_width ? c->encode_width : source->width;
+    unsigned height = c->encode_height ? c->encode_height : source->height;
     unsigned uv_height = (height + 1) / 2;
-    if (!width || !height || height > SIZE_MAX / width)
+    if (!width || !height || width > source->width || height > source->height ||
+        height > SIZE_MAX / width)
         return -1;
     size_t y_size = (size_t)width * height;
     size_t uv_size = (size_t)width * uv_height;
@@ -2814,14 +2818,8 @@ tva_encode_picture_bitrate(const struct tva_codec *c,
         break;
     }
     case PIPE_VIDEO_FORMAT_VP9: {
-        struct tva_vp9_enc_picture_desc {
-            struct pipe_picture_desc base;
-            uint32_t target_bitrate;
-            uint32_t frame_rate_num;
-            uint32_t frame_rate_den;
-        };
-        const struct tva_vp9_enc_picture_desc *vp9 =
-            (const struct tva_vp9_enc_picture_desc *)picture;
+        const struct vlVaVP9EncPictureDesc *vp9 =
+            (const struct vlVaVP9EncPictureDesc *)picture;
         return vp9->target_bitrate;
     }
     default:
@@ -2865,14 +2863,8 @@ tva_encode_picture_rate(const struct tva_codec *c,
         break;
     }
     case PIPE_VIDEO_FORMAT_VP9: {
-        struct tva_vp9_enc_picture_desc {
-            struct pipe_picture_desc base;
-            uint32_t target_bitrate;
-            uint32_t frame_rate_num;
-            uint32_t frame_rate_den;
-        };
-        const struct tva_vp9_enc_picture_desc *vp9 =
-            (const struct tva_vp9_enc_picture_desc *)picture;
+        const struct vlVaVP9EncPictureDesc *vp9 =
+            (const struct vlVaVP9EncPictureDesc *)picture;
         if (vp9->frame_rate_num && vp9->frame_rate_den) {
             *num = vp9->frame_rate_num;
             *den = vp9->frame_rate_den;
@@ -2898,8 +2890,11 @@ tva_encoder_ensure_session(struct tva_codec *c, struct pipe_video_buffer *source
     /* VA contexts may use macroblock-aligned dimensions while imported
      * input surfaces contain only the visible pixels. The MediaCodec input
      * layout must match the packed NV12 frame, including its chroma offset. */
-    cfg.width = source->width;
-    cfg.height = source->height;
+    cfg.width = c->encode_width ? c->encode_width : source->width;
+    cfg.height = c->encode_height ? c->encode_height : source->height;
+    if (!cfg.width || !cfg.height || cfg.width > source->width ||
+        cfg.height > source->height)
+        return -1;
     cfg.bitrate = c->encode_bitrate;
     cfg.fps_num = c->encode_fps_num;
     cfg.fps_den = c->encode_fps_den;
@@ -3026,6 +3021,14 @@ tva_codec_begin_frame(struct pipe_video_codec *codec,
     }
 
     if (c->encoder && picture) {
+        if (u_reduce_video_profile(c->base.profile) == PIPE_VIDEO_FORMAT_VP9) {
+            const struct vlVaVP9EncPictureDesc *vp9 =
+                (const struct vlVaVP9EncPictureDesc *)picture;
+            /* VA input surfaces include storage padding, whereas VP9 codes
+             * the requested visible dimensions in its frame header. */
+            c->encode_width = vp9->width;
+            c->encode_height = vp9->height;
+        }
         uint32_t bitrate = tva_encode_picture_bitrate(c, picture);
         if (bitrate)
             c->encode_bitrate = bitrate;

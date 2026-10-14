@@ -71,8 +71,16 @@ handleVAEncMiscParameterTypeRateControl(vlVaContext *context, VAEncMiscParameter
 
    case PIPE_VIDEO_FORMAT_VP9: {
       VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl *)misc->data;
-      if (rc->bits_per_second)
-         context->desc.vp9enc.target_bitrate = rc->bits_per_second;
+      if (rc->bits_per_second) {
+         /* In VBR, bits_per_second is the peak rate. FFmpeg commonly sends
+          * twice -b:v with target_percentage=50; forward the target rate. */
+         unsigned percentage = context->desc.vp9enc.rate_ctrl_method ==
+            PIPE_H2645_ENC_RATE_CONTROL_METHOD_CONSTANT ? 100 : rc->target_percentage;
+         if (!percentage || percentage > 100)
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+         context->desc.vp9enc.target_bitrate =
+            (uint64_t)rc->bits_per_second * percentage / 100;
+      }
       break;
    }
 
@@ -160,7 +168,7 @@ handleVAEncSequenceParameterBufferType(vlVaDriver *drv, vlVaContext *context, vl
 
    case PIPE_VIDEO_FORMAT_VP9: {
       VAEncSequenceParameterBufferVP9 *vp9 = buf->data;
-      if (vp9->bits_per_second)
+      if (vp9->bits_per_second && !context->desc.vp9enc.target_bitrate)
          context->desc.vp9enc.target_bitrate = vp9->bits_per_second;
       break;
    }
@@ -452,6 +460,12 @@ handleVAEncPictureParameterBufferType(vlVaDriver *drv, vlVaContext *context, vlV
        * that handle in the context so the bridge can submit the encoded
        * packet and expose it through VAMapBuffer. */
       VAEncPictureParameterBufferVP9 *vp9 = buf->data;
+      if (!vp9->frame_width_src || !vp9->frame_height_src ||
+          vp9->frame_width_src != vp9->frame_width_dst ||
+          vp9->frame_height_src != vp9->frame_height_dst)
+         return VA_STATUS_ERROR_INVALID_PARAMETER;
+      context->desc.vp9enc.width = vp9->frame_width_dst;
+      context->desc.vp9enc.height = vp9->frame_height_dst;
       vlVaBuffer *coded_buf = handle_table_get(drv->htab, vp9->coded_buf);
       if (!coded_buf)
          return VA_STATUS_ERROR_INVALID_BUFFER;

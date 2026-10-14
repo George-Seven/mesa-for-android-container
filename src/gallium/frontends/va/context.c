@@ -439,6 +439,14 @@ vlVaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width,
       }
       break;
 
+   case PIPE_VIDEO_FORMAT_VP9:
+      if (is_encode) {
+         context->desc.vp9enc.rate_ctrl_method = config->rc;
+         context->desc.vp9enc.frame_rate_num = 30;
+         context->desc.vp9enc.frame_rate_den = 1;
+      }
+      break;
+
    case PIPE_VIDEO_FORMAT_AV1:
       if (is_encode) {
          context->templat.max_references = PIPE_AV1_MAX_REFERENCES;
