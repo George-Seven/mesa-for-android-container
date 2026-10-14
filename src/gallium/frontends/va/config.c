@@ -800,7 +800,7 @@ vlVaQueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id, VAProfile 
    vlVaConfig *config;
 
    //fprintf(stderr, "tva-va: query config attrs config=%u list=%p count=%d\n",
-           config_id, (void *)attrib_list, num_attribs ? *num_attribs : 0);
+   //        config_id, (void *)attrib_list, num_attribs ? *num_attribs : 0);
 
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
