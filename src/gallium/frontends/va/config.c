@@ -625,7 +625,7 @@ vlVaCreateConfig(VADriverContextP ctx, VAProfile profile, VAEntrypoint entrypoin
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
    //fprintf(stderr, "tva-va: create config profile=%d entrypoint=%d attrs=%d\n",
-           profile, entrypoint, num_attribs);
+   //        profile, entrypoint, num_attribs);
 
    drv = VL_VA_DRIVER(ctx);
    pscreen = VL_VA_PSCREEN(ctx);
