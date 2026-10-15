@@ -172,7 +172,7 @@ rebind_resource(struct fd_resource *rsc) assert_dt
  * the same cache invalidation explicit for imported resources as well.
  */
 static void
-fd_resource_changed(struct pipe_screen *pscreen, struct pipe_resource *prsc)
+fd_resource_changed(struct pipe_screen *pscreen, struct pipe_resource *prsc) assert_dt
 {
    (void)pscreen;
    if (!prsc)

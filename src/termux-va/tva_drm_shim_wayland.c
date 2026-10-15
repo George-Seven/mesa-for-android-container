@@ -30,10 +30,10 @@
 static const char *const kgsl_path = "/dev/kgsl-3d0";
 static const char *const mali_path = "/dev/mali0";
 
-#if defined(__GLIBC__) || defined(__BIONIC__)
+#if defined(__GLIBC__)
 typedef unsigned long tva_ioctl_request_t;
 #else
-/* musl declares ioctl(2)'s request argument as int. */
+/* bionic and musl declare ioctl(2)'s request argument as int. */
 typedef int tva_ioctl_request_t;
 #endif
 
