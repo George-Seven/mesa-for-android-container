@@ -892,9 +892,6 @@ with_termux_va_bridge = with_gallium_va and not _termux_va_bridge.disabled()
 
 _termux_va_wayland_shim = get_option('termux-va-wayland-shim')
 if _termux_va_wayland_shim.enabled()
-  if host_machine.system() != 'linux'
-    error('termux-va-wayland-shim requires a Linux host')
-  endif
   if not with_platform_wayland
     error('termux-va-wayland-shim requires the Wayland platform')
   endif
