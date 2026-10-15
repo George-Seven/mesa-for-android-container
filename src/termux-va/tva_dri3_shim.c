@@ -108,6 +108,23 @@ track_open(xcb_connection_t *connection, uint64_t sequence, uint8_t opcode)
    pthread_mutex_unlock(&pending_mutex);
 }
 
+static bool
+is_pending_open(xcb_connection_t *connection, uint64_t sequence)
+{
+   if (!enabled())
+      return false;
+   bool found = false;
+   pthread_mutex_lock(&pending_mutex);
+   for (unsigned i = 0; i < sizeof(pending) / sizeof(pending[0]); i++) {
+      if (pending[i].connection == connection && pending[i].sequence == sequence) {
+         found = true;
+         break;
+      }
+   }
+   pthread_mutex_unlock(&pending_mutex);
+   return found;
+}
+
 static void
 complete_open(xcb_connection_t *connection, uint64_t sequence, void **reply,
               xcb_generic_error_t **error)
@@ -165,14 +182,22 @@ type name(xcb_connection_t *connection, int flags, struct iovec *vector, \
 SEND_WRAPPER(xcb_send_request, unsigned, real_send)
 SEND_WRAPPER(xcb_send_request64, uint64_t, real_send64)
 
+/* Some callers (including KWin) discard checked errors by passing NULL.
+ * Capture those errors only for tracked Open requests so the fallback still
+ * runs, then release any error the caller did not request. */
 #define POLL_WRAPPER(name, type, real_function) \
 int name(xcb_connection_t *connection, type sequence, void **reply, \
          xcb_generic_error_t **error) \
 { \
    pthread_once(&symbols_once, load_symbols); \
-   int ready = real_function(connection, sequence, reply, error); \
+   xcb_generic_error_t *ignored_error = NULL; \
+   xcb_generic_error_t **reply_error = error; \
+   if (!error && is_pending_open(connection, sequence)) \
+      reply_error = &ignored_error; \
+   int ready = real_function(connection, sequence, reply, reply_error); \
    if (ready) \
-      complete_open(connection, sequence, reply, error); \
+      complete_open(connection, sequence, reply, reply_error); \
+   free(ignored_error); \
    return ready; \
 }
 POLL_WRAPPER(xcb_poll_for_reply, unsigned, real_poll)
@@ -182,8 +207,13 @@ POLL_WRAPPER(xcb_poll_for_reply64, uint64_t, real_poll64)
 void *name(xcb_connection_t *connection, type sequence, xcb_generic_error_t **error) \
 { \
    pthread_once(&symbols_once, load_symbols); \
-   void *reply = real_function(connection, sequence, error); \
-   complete_open(connection, sequence, &reply, error); \
+   xcb_generic_error_t *ignored_error = NULL; \
+   xcb_generic_error_t **reply_error = error; \
+   if (!error && is_pending_open(connection, sequence)) \
+      reply_error = &ignored_error; \
+   void *reply = real_function(connection, sequence, reply_error); \
+   complete_open(connection, sequence, &reply, reply_error); \
+   free(ignored_error); \
    return reply; \
 }
 WAIT_WRAPPER(xcb_wait_for_reply, unsigned, real_wait)

@@ -134,6 +134,23 @@ Chromium WebCodecs encoding
 
 AVC hardware encoding additionally requires ``AcceleratedVideoEncoder`` in the Chromium feature list. On Arm64 Chromium builds where hardware VBR is disabled, explicitly request ``bitrateMode: "constant"`` together with ``hardwareAcceleration: "prefer-hardware"``; WebCodecs defaults to variable bitrate and may reject that configuration before creating an encoder. Chromium's VA-API encoder does not currently expose HEVC encoding, even when libva advertises it.
 
+The DRI3 fallback above fixes X11 rendering and video playback, but does not enable Chromium's native X11 WebCodecs encoding path. In the Chromium 154 reference source, ``OzonePlatformX11::IsNativePixmapConfigSupported()`` always returns false. On the tested Chrome 155 build, encoding can therefore receive a shared-memory-backed frame instead of the native NV12 pixmap required by the VA-API encoder and terminate the GPU process. Changing the video zero-copy feature can instead produce an allocation error; neither failure can be fixed by Mesa's buffer allocator because Chromium rejects native buffer allocation first.
+
+To retain the Termux:X11 desktop without rebuilding Chromium, run Chrome as a Wayland client inside a nested KWin window. Preload the shim into KWin with ``TERMUX_VA_X11_DRI3=1`` so its X11 backend can obtain a KGSL device and advertise linux-dmabuf formats. The shim also handles checked DRI3 Open requests whose callers pass a null error pointer, as KWin does. Use the same ``XDG_RUNTIME_DIR`` for KWin and Chrome, and exit the previous Chrome instance before switching its platform backend.
+
+.. code-block:: sh
+
+   export DISPLAY=:2 XDG_RUNTIME_DIR=/run/user/$(id -u)
+   env -u WAYLAND_DISPLAY -u ANLAND_NO_DRM_DEVICE \
+     LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libtva_drm_shim_wayland.so \
+     TERMUX_VA_X11_DRI3=1 TERMUX_VA_GPU_BACKEND=kgsl \
+     MESA_LOADER_DRIVER_OVERRIDE=kgsl TURNIP_KMD=kgsl QT_QPA_PLATFORM=xcb \
+     dbus-run-session kwin_wayland --x11-display "$DISPLAY" \
+       --socket wayland-tva-convert --width 1280 --height 800 \
+       --no-lockscreen --no-global-shortcuts --no-kactivities
+
+After KWin creates the socket, launch Chrome from another terminal with ``WAYLAND_DISPLAY=wayland-tva-convert``, the Wayland preload configuration, ``--ozone-platform=wayland``, ``--use-angle=gles``, and ``--render-node-override=/dev/kgsl-3d0``. Enable ``AcceleratedVideoEncoder`` and ``AcceleratedVideoDecodeLinuxZeroCopyGL`` as well as the decoder features. This uses Chromium's Wayland encoding path inside an X11 window; native ``--ozone-platform=x11`` encoding remains unsupported on the tested build. Keep the daemon current for 4K input: a 3840x1920 NV12 frame occupies 11,059,200 bytes and exceeds the old 8 MiB encoder input limit.
+
 AVC encode profiles are forwarded explicitly to MediaCodec: Baseline uses the compatible Constrained Baseline subset, and Main and High retain their requested profiles. Update the daemon and bridge together for this support; the profile-specific codec IDs are rejected by older daemons. The daemon validates the encoded SPS and fails the session if the hardware substitutes a different profile. Legacy encoder clients using codec ID 5 retain the device-default behavior.
 
 The bridge forwards the encoder frame-rate numerator and denominator to the daemon. The daemon accepts common fractional rates such as 30000/1001 and 60000/1001, configures a floating-point MediaCodec rate when needed, and computes input timestamps without accumulated rounding drift. Chromium 154's VA-API capability query imposes a separate hard-coded 30 fps maximum and its VEA interface passes an integer frame-rate hint; these Chromium limits cannot be removed by changing Mesa. Applications such as FFmpeg can pass the exact rational rate directly.
