@@ -105,6 +105,30 @@ and ``--hardware-video-device-path=/dev/kgsl-3d0``:
 The standard libva DRM backend also rejects a KGSL fd; use this Mesa build's
 bridge driver or an equivalent KGSL-aware compatibility layer.
 
+Chromium on Termux:X11
+---------------------
+
+Termux:X11 supports DRI3 pixmap imports but does not provide the DRM descriptor requested by DRI3 Open. Chromium's X11 GBM initialization therefore fails with ``BadMatch``. With ``--enable-zero-copy``, this can leave webpage tiles white while the browser UI remains visible. Disabling zero-copy restores ordinary webpage rendering, but hardware video frames may still fail with ``Could not find SharedImageBackingFactory`` because the GBM device is missing.
+
+When the shim is built with the X11 platform enabled, set ``TERMUX_VA_X11_DRI3=1`` and preload ``libtva_drm_shim_wayland.so`` to enable a process-local fallback. It replaces only a checked DRI3 Open ``BadMatch`` reply with a real KGSL descriptor; native successful replies and other X11 operations are unchanged. The fallback also enables KGSL DMA-BUF allocations before GBM device creation. It is disabled by default and does not require a Chromium or Termux:X11 rebuild.
+
+Use ``--use-angle=gles-egl`` rather than ``--use-angle=gles``. On the tested Termux:X11 stack, the former exposes ``EGL_EXT_image_dma_buf_import`` and displays both raster tiles and decoded video, while the latter uses a GLX pixmap path that displays black imported buffers. Chromium's raster zero-copy switch can remain enabled with this configuration; it is independent of ``AcceleratedVideoDecodeLinuxZeroCopyGL``.
+
+.. code-block:: sh
+
+   DISPLAY=:2 XDG_RUNTIME_DIR=/run/user/$(id -u) \
+   LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libtva_drm_shim_wayland.so \
+   LIBVA_DRIVER_NAME=termuxva TERMUX_VA_BRIDGE=1 \
+   TERMUX_VA_GPU_BACKEND=kgsl TERMUX_VA_X11_DRI3=1 \
+   MESA_LOADER_DRIVER_OVERRIDE=kgsl TURNIP_KMD=kgsl \
+   google-chrome --ozone-platform=x11 --no-sandbox --use-gl=angle \
+     --use-angle=gles-egl --disable-gpu-rasterization \
+     --enable-features=AcceleratedVideoDecoder,AcceleratedVideoDecodeLinuxGL,PlatformHEVCDecoderSupport \
+     --disable-features=AcceleratedVideoDecodeLinuxZeroCopyGL,VaapiVideoMinResolutionForPerformance \
+     --enable-gpu-compositing --enable-zero-copy \
+     --enable-native-gpu-memory-buffers --ignore-gpu-blocklist \
+     --hardware-video-device-path=/dev/kgsl-3d0
+
 Chromium WebCodecs encoding
 --------------------------
 

@@ -1445,6 +1445,20 @@ decode).  See :doc:`termux-va`.
    - ``drm``: use stock loader selection only.
    - ``sw``: use llvmpipe only; no GPU is needed for the CPU frame-copy paths.
 
+.. envvar:: TERMUX_VA_X11_DRI3
+
+   set to ``1``, ``true`` or ``on`` to enable the process-local DRI3 Open
+   fallback in ``libtva_drm_shim_wayland.so`` when it is preloaded. This
+   requires an X11-enabled shim build. If an X server returns ``BadMatch``
+   for a checked DRI3 Open request, the shim supplies a real descriptor for
+   ``/dev/kgsl-3d0`` so Chromium can initialize its X11 GBM device. Successful
+   replies and unrelated requests are passed through. This is disabled by
+   default and does not expose a DRM node system-wide.
+
+   On Termux:X11, use ``--use-angle=gles-egl`` to import the resulting
+   DMA-BUFs through EGL. The GLX-backed ``--use-angle=gles`` path may display
+   black native-pixmap contents even after GBM initialization succeeds.
+
 .. envvar:: TERMUX_VA_DISABLE_AVC
 
    set to ``1``, ``true`` or ``on`` to hide the H.264/AVC profiles from
