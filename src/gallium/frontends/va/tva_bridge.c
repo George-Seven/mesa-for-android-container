@@ -583,6 +583,28 @@ struct tva_codec {
     bool reorder_drain_sent;
 };
 
+/* Locking contract for one codec instance
+ * ---------------------------------------
+ *
+ * pend_mutex protects the pending ring, fence state, and its condition
+ * variable.  The reader and application threads may hold it while touching
+ * those objects, but must release it before calling a helper which can write
+ * to the daemon socket or serialize AV1 assembly.  In particular, fence wait
+ * and fence destruction drop pend_mutex before calling tva_send_drain() or
+ * tva_av1_flush_pending().
+ *
+ * av1_mutex serializes AV1 temporal-unit assembly.  The AV1 flush path may
+ * acquire io_mutex through tva_send_unit(); therefore that path's order is
+ * av1_mutex -> io_mutex.  Error handling may acquire pend_mutex after the
+ * socket write has returned, so it also follows av1_mutex -> pend_mutex.
+ *
+ * io_mutex is the leaf lock for the full-duplex daemon connection.  It only
+ * serializes writers and must never be held while acquiring pend_mutex or
+ * av1_mutex.  There is deliberately no path which holds pend_mutex while
+ * acquiring either writer lock; keeping the pending lock out of socket I/O
+ * prevents the reader and fence paths from forming a lock cycle.
+ */
+
 static struct tva_codec *
 tva_codec(struct pipe_video_codec *codec)
 {
@@ -591,7 +613,9 @@ tva_codec(struct pipe_video_codec *codec)
 
 /* The daemon connection is full duplex, but its byte stream is not safe for
  * concurrent writers.  Keep all access-unit and drain requests serialized;
- * the reader thread remains free to receive frames while a writer is active. */
+ * the reader thread remains free to receive frames while a writer is active.
+ * This is the leaf lock in the codec lock hierarchy; callers must not hold
+ * io_mutex while acquiring pend_mutex or av1_mutex. */
 static int
 tva_send_unit(struct tva_codec *c, const void *data, size_t len)
 {
@@ -612,6 +636,10 @@ tva_send_drain(struct tva_codec *c)
 
    if (!c || !c->sess)
       return TVA_ERR_STATE;
+   /* Locking contract: acquires only io_mutex and releases it before
+    * returning.  Callers that wait with pend_mutex held must drop that lock
+    * first; this helper must never be called while pend_mutex or av1_mutex is
+    * held. */
    mtx_lock(&c->io_mutex);
    ret = tva_session_drain(c->sess);
    mtx_unlock(&c->io_mutex);
@@ -3725,7 +3753,13 @@ failed:
 
 /* Flush a temporal unit while serializing access to the AV1 assembly state.
  * The normal VA submission path and a late fence wait can reach this helper
- * from different FFmpeg worker threads at end of stream. */
+ * from different FFmpeg worker threads at end of stream.
+ *
+ * Locking contract: this helper acquires av1_mutex and may acquire the leaf
+ * io_mutex through tva_av1_send_pending().  On an error, the pending-state
+ * cleanup is performed after the socket lock has been released and may take
+ * pend_mutex.  It must therefore be called with pend_mutex and io_mutex
+ * released; its lock order is av1_mutex -> io_mutex/pend_mutex. */
 static int
 tva_av1_flush_pending(struct tva_codec *c, bool terminal)
 {
