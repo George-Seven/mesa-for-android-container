@@ -653,8 +653,10 @@ cmd_buffer_flush_mesh_inline_data(struct anv_cmd_buffer *cmd_buffer,
       uint64_t push_addr64 =
          get_mesh_task_push_addr64(cmd_buffer, gfx, MESA_SHADER_TASK);
 
-      anv_batch_emit(&cmd_buffer->batch, GENX(3DSTATE_TASK_SHADER_DATA), data)
+      anv_batch_emit(&cmd_buffer->batch, GENX(3DSTATE_TASK_SHADER_DATA), data) {
+         assert(bind_map->inline_dwords_count <= ARRAY_SIZE(data.InlineData));
          fill_inline_params(data.InlineData, bind_map, gfx, push_addr64);
+      }
    }
 
    if (dirty_stages & VK_SHADER_STAGE_MESH_BIT_EXT &&
@@ -664,8 +666,10 @@ cmd_buffer_flush_mesh_inline_data(struct anv_cmd_buffer *cmd_buffer,
       uint64_t push_addr64 =
          get_mesh_task_push_addr64(cmd_buffer, gfx, MESA_SHADER_MESH);
 
-      anv_batch_emit(&cmd_buffer->batch, GENX(3DSTATE_MESH_SHADER_DATA), data)
+      anv_batch_emit(&cmd_buffer->batch, GENX(3DSTATE_MESH_SHADER_DATA), data) {
+         assert(bind_map->inline_dwords_count <= ARRAY_SIZE(data.InlineData));
          fill_inline_params(data.InlineData, bind_map, gfx, push_addr64);
+      }
    }
 }
 #endif
@@ -712,6 +716,8 @@ cmd_buffer_maybe_flush_rt_writes(struct anv_cmd_buffer *cmd_buffer,
          need_rt_flush = true;
       }
    }
+
+   need_rt_flush &= GFX_VERx10 < 350 || !cmd_buffer->device->physical->uses_efficient_64bit;
 
    if (need_rt_flush) {
       anv_cmd_buffer_dirty_descriptors(cmd_buffer,
@@ -990,6 +996,7 @@ cmd_buffer_flush_gfx_state(struct anv_cmd_buffer *cmd_buffer)
 static inline void
 cmd_buffer_flush_gfx_pointers(struct anv_cmd_buffer *cmd_buffer)
 {
+   struct anv_device *device = cmd_buffer->device;
    struct anv_cmd_graphics_state *gfx = &cmd_buffer->state.gfx;
 
    assert(gfx->base != NULL);
@@ -1024,7 +1031,8 @@ cmd_buffer_flush_gfx_pointers(struct anv_cmd_buffer *cmd_buffer)
     * emitting push constants, on SKL+ we have to emit the corresponding
     * 3DSTATE_BINDING_TABLE_POINTER_* for the push constants to take effect.
     */
-   if (descriptors_dirty) {
+   if (descriptors_dirty &&
+       !(GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit)) {
       cmd_buffer->state.descriptors_pointers_dirty |=
          genX(cmd_buffer_flush_descriptor_sets)(
             cmd_buffer,
@@ -1909,6 +1917,17 @@ emit_indirect_draws(struct anv_cmd_buffer *cmd_buffer,
    const struct anv_cmd_graphics_state *gfx = &cmd_buffer->state.gfx;
    const struct brw_vs_prog_data *vs_prog_data = get_gfx_vs_prog_data(gfx);
 #endif
+
+#if GFX_VER >= 20
+   if (cmd_buffer->state.mi_indirect_data_needs_cs_stall) {
+      anv_add_pending_pipe_bits(cmd_buffer,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                ANV_PIPE_CS_STALL_BIT,
+                                "MI commands load indirect data");
+   }
+#endif
+
    cmd_buffer_flush_gfx(cmd_buffer);
 
    if (cmd_buffer->state.conditional_render_enabled)
@@ -1986,8 +2005,8 @@ static inline uint32_t xi_argument_format_for_vk_cmd(enum vk_cmd_type cmd)
 #endif
 }
 
-/* Return whether EXECUTE_INDIRECT_DRAW can unroll all the draw calls or
- * whether we need to emit the max count.
+/* Return whether EXECUTE_INDIRECT_DRAW can unroll all the draw calls (returns false)
+ * or whether we need to emit the max count (returns true).
  */
 static inline bool
 cmd_buffer_set_indirect_stride(struct anv_cmd_buffer *cmd_buffer,
@@ -2036,7 +2055,7 @@ cmd_buffer_set_indirect_stride(struct anv_cmd_buffer *cmd_buffer,
    /* Gfx20+ can accomodate any stride through programming STATE_BYTE_STRIDE,
     * ARL cannot unless indirect data is aligned.
     */
-   return GFX_VER >= 20 ? false : aligned;
+   return GFX_VER >= 20 ? false : !aligned;
 }
 
 static void

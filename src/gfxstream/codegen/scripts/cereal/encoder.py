@@ -1,6 +1,7 @@
 # Copyright 2018 Google LLC
 # SPDX-License-Identifier: MIT
 import copy
+import re
 
 from .common.codegen import CodeGen, VulkanWrapperGenerator
 from .common.vulkantypes import \
@@ -74,6 +75,7 @@ ENCODER_CUSTOM_RESOURCE_POSTPROCESS = [
     "vkMapMemoryIntoAddressSpaceGOOGLE",
     "vkGetPhysicalDeviceFeatures2",
     "vkCreateDescriptorUpdateTemplate",
+    "vkCreateDescriptorUpdateTemplateKHR",
     "vkGetPhysicalDeviceExternalSemaphoreProperties",
 ]
 
@@ -166,7 +168,7 @@ def emit_marshal(typeInfo, param, cgen):
             VulkanReservedMarshalingCodegen( \
                 cgen, "guest", STREAM, ROOT_TYPE_DEFAULT_VALUE, param.paramName, "streamPtrPtr",
                API_PREFIX_RESERVEDMARSHAL,
-               "" if forOutput else "get_host_u64_",
+               "" if forOutput else "gfxstream_to_host_u64",
                direction="write"))
     if not res:
         cgen.stmt("(void)%s" % param.paramName)
@@ -174,12 +176,15 @@ def emit_marshal(typeInfo, param, cgen):
     if forOutput:
         cgen.stmt("/* is handle, possibly out */")
 
+def get_gfxstream_vk_type_name(vk_type_name):
+    return "gfxstream_" + re.sub(r'(?<!^)(?=[A-Z][a-z]|(?<=[a-z])[A-Z])', '_', vk_type_name).lower()
+
 def emit_unmarshal(typeInfo, param, cgen):
     iterateVulkanType(
         typeInfo, param,
         VulkanMarshalingCodegen( \
             cgen, STREAM, ROOT_TYPE_DEFAULT_VALUE, param.paramName,
-           API_PREFIX_UNMARSHAL, direction="read"))
+           API_PREFIX_UNMARSHAL, direction="read", action=param.action, variant="guest"))
 
 def emit_deepcopy(typeInfo, param, cgen):
     res = \
@@ -208,10 +213,22 @@ def custom_encoder_args(api):
     return params
 
 def emit_handlemap_destroy(typeInfo, param, cgen):
-    iterateVulkanType(typeInfo, param, HandleMapCodegen(
-        cgen, None, "sResourceTracker->destroyMapping()", "handlemap_",
-        lambda vtype: typeInfo.isHandleType(vtype.typeName)
-    ))
+    gfxstreamType = get_gfxstream_vk_type_name(param.typeName)
+    if param.pointerIndirectionLevels > 0:
+        lenAccess = cgen.generalLengthAccess(param, parentVarName=None)
+        cgen.beginIf(param.paramName)
+        if lenAccess and lenAccess != "1":
+            cgen.beginFor("uint32_t i = 0", "i < %s" % lenAccess, "++i")
+            cgen.stmt("sResourceTracker->unregister_%s(%s[i])" % (param.typeName, param.paramName))
+            cgen.stmt("delete_%s(%s[i])" % (gfxstreamType, param.paramName))
+            cgen.endFor()
+        else:
+            cgen.stmt("sResourceTracker->unregister_%s(*%s)" % (param.typeName, param.paramName))
+            cgen.stmt("delete_%s(*%s)" % (gfxstreamType, param.paramName))
+        cgen.endIf()
+    else:
+        cgen.stmt("sResourceTracker->unregister_%s(%s)" % (param.typeName, param.paramName))
+        cgen.stmt("delete_%s(%s)" % (gfxstreamType, param.paramName))
 
 class EncodingParameters(object):
     def __init__(self, api):
@@ -390,23 +407,11 @@ def emit_parameter_encode_read(typeInfo, api, cgen):
     encodingParams = EncodingParameters(api)
 
     for p in encodingParams.toRead:
-        if p.action == "create":
-            cgen.stmt(
-                "%s->setHandleMapping(%s->createMapping())" % \
-                (STREAM, RESOURCES))
         emit_unmarshal(typeInfo, p, cgen)
-        if p.action == "create":
-            cgen.stmt(
-                "%s->unsetHandleMapping()" % STREAM)
         emit_transform(typeInfo, p, cgen, variant="fromhost")
 
 def emit_post(typeInfo, api, cgen):
     encodingParams = EncodingParameters(api)
-
-    emit_custom_resource_postprocess(typeInfo, api, cgen)
-
-    for p in encodingParams.toDestroy:
-        emit_handlemap_destroy(typeInfo, p, cgen)
 
     doSeqno = True
     if is_cmdbuf_dispatch(api):
@@ -415,14 +420,16 @@ def emit_post(typeInfo, api, cgen):
     retType = api.getRetTypeExpr()
 
     if api.name in ENCODER_EXPLICIT_FLUSHED_APIS:
-        cgen.stmt("stream->flush()");
-        return
-
-    if doSeqno:
+        cgen.stmt("stream->flush()")
+    elif doSeqno:
         if retType == "void":
-            encodingParams = EncodingParameters(api)
             if 0 == len(encodingParams.toRead):
-                cgen.stmt("stream->flush()");
+                cgen.stmt("stream->flush()")
+
+    emit_custom_resource_postprocess(typeInfo, api, cgen)
+
+    for p in encodingParams.toDestroy:
+        emit_handlemap_destroy(typeInfo, p, cgen)
 
 def emit_pool_free(cgen):
     cgen.stmt("++encodeCount")
@@ -551,8 +558,8 @@ def encode_vkFlushMappedMemoryRanges(typeInfo, api, cgen):
         cgen.stmt("auto offset = range.offset")
         cgen.stmt("uint64_t streamSize = 0")
         cgen.stmt("if (!memory) { %s->write(&streamSize, sizeof(uint64_t)); continue; }" % streamVar)
-        cgen.stmt("auto hostPtr = sResourceTracker->getMappedPointer(memory)")
-        cgen.stmt("auto actualSize = size == VK_WHOLE_SIZE ? sResourceTracker->getMappedSize(memory) : size")
+        cgen.stmt("auto hostPtr = gfxstream_vk_device_memory_get_ptr(memory)")
+        cgen.stmt("auto actualSize = size == VK_WHOLE_SIZE ? gfxstream_vk_device_memory_get_ptr_size(memory) : size")
         cgen.stmt("if (!hostPtr) { %s->write(&streamSize, sizeof(uint64_t)); continue; }" % streamVar)
         cgen.stmt("streamSize = actualSize")
         cgen.stmt("%s->write(&streamSize, sizeof(uint64_t))" % streamVar)
@@ -590,8 +597,8 @@ def encode_vkInvalidateMappedMemoryRanges(typeInfo, api, cgen):
         cgen.stmt("auto offset = range.offset")
         cgen.stmt("uint64_t streamSize = 0")
         cgen.stmt("if (!memory) { %s->read(&streamSize, sizeof(uint64_t)); continue; }" % streamVar)
-        cgen.stmt("auto hostPtr = sResourceTracker->getMappedPointer(memory)")
-        cgen.stmt("auto actualSize = size == VK_WHOLE_SIZE ? sResourceTracker->getMappedSize(memory) : size")
+        cgen.stmt("auto hostPtr = gfxstream_vk_device_memory_get_ptr(memory)")
+        cgen.stmt("auto actualSize = size == VK_WHOLE_SIZE ? gfxstream_vk_device_memory_get_ptr_size(memory) : size")
         cgen.stmt("if (!hostPtr) { %s->read(&streamSize, sizeof(uint64_t)); continue; }" % streamVar)
         cgen.stmt("streamSize = actualSize")
         cgen.stmt("%s->read(&streamSize, sizeof(uint64_t))" % streamVar)
@@ -629,6 +636,8 @@ def unwrap_vkAcquireImageANDROID_nativeFenceFd():
 custom_encodes = {
     "vkMapMemory" : emit_only_resource_event,
     "vkUnmapMemory" : emit_only_resource_event,
+    "vkMapMemory2" : emit_only_resource_event,
+    "vkUnmapMemory2" : emit_only_resource_event,
     "vkFlushMappedMemoryRanges" : encode_vkFlushMappedMemoryRanges,
     "vkInvalidateMappedMemoryRanges" : encode_vkInvalidateMappedMemoryRanges,
     "vkCreateImage" : emit_with_custom_unwrap(unwrap_vkCreateImage_pCreateInfo()),

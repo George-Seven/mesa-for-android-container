@@ -5147,7 +5147,7 @@ tva_bridge_vscreen_create(int fd, bool honor_dri_prime)
         /* 1. stock selection (correct on normal GPU render nodes).  The kgsl
          * stack fails here by construction: the display node's kernel name
          * matches no descriptor and zink has no Vulkan device. */
-        struct vl_screen *vscreen = vl_drm_screen_create(fd, honor_dri_prime);
+        struct vl_screen *vscreen = vl_drm_screen_create(fd, honor_dri_prime, false);
         if (vscreen) {
             if (opened_fd >= 0)
                 close(opened_fd);
@@ -5170,7 +5170,7 @@ tva_bridge_vscreen_create(int fd, bool honor_dri_prime)
         setenv("MESA_LOADER_DRIVER_OVERRIDE", "kgsl", 1);
         setenv("FD_FORCE_KGSL", "1", 0);
         setenv("FD_KGSL_ENABLE_DMABUF", "1", 0);
-        struct vl_screen *vscreen = vl_drm_screen_create(fd, honor_dri_prime);
+        struct vl_screen *vscreen = vl_drm_screen_create(fd, honor_dri_prime, false);
         if (saved) {
             setenv("MESA_LOADER_DRIVER_OVERRIDE", saved, 1);
             free(saved);
@@ -5196,7 +5196,7 @@ tva_bridge_vscreen_create(int fd, bool honor_dri_prime)
         return vscreen;
     }
     if (!strcmp(backend, "drm")) {
-        struct vl_screen *vscreen = vl_drm_screen_create(fd, honor_dri_prime);
+        struct vl_screen *vscreen = vl_drm_screen_create(fd, honor_dri_prime, false);
         if (opened_fd >= 0)
             close(opened_fd);
         return vscreen;

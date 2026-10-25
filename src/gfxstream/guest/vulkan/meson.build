@@ -24,6 +24,10 @@ if with_platform_wayland
     gfxstream_vk_wsi_args += '-DGFXSTREAM_VK_WAYLAND'
 endif
 
+if with_platform_macos
+    gfxstream_vk_wsi_args += '-DGFXSTREAM_VK_METAL'
+endif
+
 files_vulkan_gfxstream = files_lib_vulkan_gfxstream + files_lib_vulkan_enc
 files_vulkan_gfxstream += gfxstream_vk_entrypoints
 
@@ -45,7 +49,6 @@ lib_vulkan_gfxstream = shared_library(
     files_vulkan_gfxstream,
     cpp_args: gfxstream_guest_args + gfxstream_vk_wsi_args,
     include_directories: [
-        inc_vulkan_headers,
         inc_guest_iostream,
         inc_vulkan_enc,
         inc_goldfish_address_space,

@@ -123,7 +123,7 @@ static void si_set_max_shader_compiler_threads(struct pipe_screen *screen, unsig
 
    /* This function doesn't allow a greater number of threads than
     * the queue had at its creation. */
-   util_queue_adjust_num_threads(&sscreen->shader_compiler_queue, max_threads, false);
+   util_queue_adjust_num_threads(&sscreen->shader_compiler_queue, max_threads);
    /* Don't change the number of threads on the low priority queue. */
 }
 
@@ -653,6 +653,7 @@ static void si_init_gfx_caps(struct si_screen *sscreen)
    caps->cl_gl_sharing = true;
    caps->call_finalize_nir_in_linker = true;
    caps->blit_3d = true;
+   caps->polygon_stipple = true;
    caps->glsl_bindless_handles_are_32bit = true;
    caps->fbfetch = 1;
 
@@ -842,7 +843,9 @@ bool si_init_gfx_screen(struct si_screen *sscreen) {
    support_llvm = strlen(ac_get_llvm_processor_name(sscreen->info.family)) != 0;
 #endif
 
-   sscreen->has_gfx_compute = support_aco || support_llvm;
+   sscreen->has_gfx_compute = (support_aco || support_llvm) &&
+                              (sscreen->info.ip[AMD_IP_GFX].num_queues > 0 ||
+                               sscreen->info.ip[AMD_IP_COMPUTE].num_queues > 0);
 
    if (!sscreen->has_gfx_compute)
       return true;

@@ -943,7 +943,10 @@ vtn_get_builtin_location(struct vtn_builder *b,
       } else if (b->shader->info.stage == MESA_SHADER_GEOMETRY) {
          *location = VARYING_SLOT_LAYER;
          *mode = nir_var_shader_out;
-      } else if (b->supported_capabilities.ShaderViewportIndexLayerEXT &&
+      } else if ((b->supported_capabilities.ShaderViewportIndexLayerEXT ||
+                  b->supported_capabilities.ShaderLayer ||
+                  b->supported_capabilities.MeshShadingEXT ||
+                  b->supported_capabilities.MeshShadingNV) &&
                (b->shader->info.stage == MESA_SHADER_VERTEX ||
                 b->shader->info.stage == MESA_SHADER_TESS_EVAL ||
                 b->shader->info.stage == MESA_SHADER_MESH)) {
@@ -957,7 +960,10 @@ vtn_get_builtin_location(struct vtn_builder *b,
       *location = VARYING_SLOT_VIEWPORT;
       if (b->shader->info.stage == MESA_SHADER_GEOMETRY) {
          *mode = nir_var_shader_out;
-      } else if (b->supported_capabilities.ShaderViewportIndexLayerEXT &&
+      } else if ((b->supported_capabilities.ShaderViewportIndexLayerEXT ||
+                  b->supported_capabilities.ShaderViewportIndex ||
+                  b->supported_capabilities.MeshShadingEXT ||
+                  b->supported_capabilities.MeshShadingNV) &&
                (b->shader->info.stage == MESA_SHADER_VERTEX ||
                 b->shader->info.stage == MESA_SHADER_TESS_EVAL ||
                 b->shader->info.stage == MESA_SHADER_MESH)) {
@@ -1013,6 +1019,8 @@ vtn_get_builtin_location(struct vtn_builder *b,
    case SpvBuiltInSampleMask:
       if (*mode == nir_var_shader_out) {
          *location = FRAG_RESULT_SAMPLE_MASK;
+         assert(b->shader->info.stage == MESA_SHADER_FRAGMENT);
+         b->shader->info.fs.sample_mask_out_declared = true;
       } else {
          *location = SYSTEM_VALUE_SAMPLE_MASK_IN;
          set_mode_system_value(b, mode);
@@ -1637,7 +1645,6 @@ var_decoration_cb(struct vtn_builder *b, struct vtn_value *val, int member,
       return;
    case SpvDecorationInputAttachmentIndex:
       vtn_var->input_attachment_index = dec->operands[0];
-      vtn_var->access |= ACCESS_NON_WRITEABLE;
       return;
    case SpvDecorationAlignment:
       var_set_alignment(b, vtn_var, dec->operands[0]);

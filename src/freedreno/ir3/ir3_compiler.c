@@ -126,8 +126,8 @@ static const nir_shader_compiler_options ir3_base_options = {
    .lower_fmod = true,
    .lower_fdiv = true,
    .lower_isign = true,
-   .lower_uadd_carry = true,
-   .lower_usub_borrow = true,
+   .lower_ifind_msb = true,
+   .lower_ufind_msb = true,
    .lower_mul_high = true,
    .lower_mul_2x32_64 = true,
    .float_mul_add16 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
@@ -156,6 +156,7 @@ static const nir_shader_compiler_options ir3_base_options = {
    .lower_pack_split = true,
    .lower_pack_64_4x16 = true,
    .lower_to_scalar = true,
+   .has_find_msb_rev = true,
    .has_imul24 = true,
    .has_umul24 = true,
    .has_umul_16x16 = true,
@@ -325,6 +326,15 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
       compiler->max_const_frag = 512;
       compiler->max_const_compute = 512;
 
+      /* a5xx maps the UAV descriptor table into the top 64 vec4 of every
+       * stage's constant window, so a stage can use only the 448 below it.
+       */
+      if (compiler->gen == 5) {
+         compiler->max_const_geom = 448;
+         compiler->max_const_frag = 448;
+         compiler->max_const_compute = 448;
+      }
+
       /* Note: this will have to change if/when we support tess+GS on
        * earlier gen's.
        */
@@ -346,17 +356,7 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
 
    compiler->has_isam_ssbo = compiler->gen >= 6;
 
-   if (compiler->gen >= 6) {
-      compiler->reg_size_vec4 = dev_info->props.reg_size_vec4;
-   } else if (compiler->gen >= 4) {
-      /* On a4xx-a5xx, using r24.x and above requires using the smallest
-       * threadsize.
-       */
-      compiler->reg_size_vec4 = 48;
-   } else {
-      /* TODO: confirm this */
-      compiler->reg_size_vec4 = 96;
-   }
+   compiler->reg_size_vec4 = dev_info->props.reg_size_vec4;
 
    if (compiler->gen >= 4) {
       /* need special handling for "flat" */
@@ -390,11 +390,14 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
    /* Set up nir shader compiler options, using device-specific overrides of our base settings. */
    compiler->nir_options = ir3_base_options;
    compiler->nir_options.has_iadd3 = dev_info->props.has_sad;
+   /* MGEN.B doesn't seem to produce useful results on FD307 */
+   compiler->nir_options.has_bfm = compiler->gen >= 4;
 
    if (compiler->gen >= 6) {
       compiler->nir_options.force_indirect_unrolling = nir_var_all,
       compiler->nir_options.lower_device_index_to_zero = true;
       compiler->nir_options.instance_id_includes_base_index = true;
+      compiler->nir_options.has_bit_test = true;
 
       if (dev_info->props.has_dp2acc || dev_info->props.has_dp4acc) {
          compiler->nir_options.has_udot_4x8 =

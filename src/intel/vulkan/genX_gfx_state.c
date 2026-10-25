@@ -659,6 +659,12 @@ calculate_tile_dimensions(const struct anv_device *device,
 
    unsigned pixel_size = 0;
 
+   /* Keep TBIMR disabled until HSDs 14024498401, 14022484703 and 14020415808
+    * are implemented.
+    */
+   if (device->info->verx10 > 30)
+      return false;
+
    /* Perform a rough calculation of the tile cache footprint of the
     * pixel pipeline, approximating it as the sum of the amount of
     * memory used per pixel by every render target, depth, stencil and
@@ -1034,14 +1040,14 @@ update_ps(struct anv_gfx_dynamic_state *hw_state,
                                hw_state->fs_config);
 
    SET(PS, ps.KernelStartPointer0,
-           fs->kernel.offset +
+           anv_shader_get_pointer(device, &fs->kernel) +
            brw_fs_prog_data_prog_offset(fs_prog_data, ps, 0));
    SET(PS, ps.KernelStartPointer1,
-           fs->kernel.offset +
+           anv_shader_get_pointer(device, &fs->kernel) +
            brw_fs_prog_data_prog_offset(fs_prog_data, ps, 1));
 #if GFX_VER < 20
    SET(PS, ps.KernelStartPointer2,
-           fs->kernel.offset +
+           anv_shader_get_pointer(device, &fs->kernel) +
            brw_fs_prog_data_prog_offset(fs_prog_data, ps, 2));
 #endif
 
@@ -1549,6 +1555,7 @@ update_clip_max_viewport(struct anv_gfx_dynamic_state *hw_state,
 
 ALWAYS_INLINE static void
 update_clip_raster(struct anv_gfx_dynamic_state *hw_state,
+                   const struct anv_device *device,
                    const struct vk_dynamic_graphics_state *dyn,
                    const struct anv_cmd_graphics_state *gfx)
 {
@@ -1599,6 +1606,7 @@ update_clip_raster(struct anv_gfx_dynamic_state *hw_state,
 
    SET(RASTER, raster.APIMode, api_mode);
    SET(RASTER, raster.DXMultisampleRasterizationEnable, msaa_raster_enable);
+   SET(RASTER, raster.ForceMultisampling, false);
    SET(RASTER, raster.AntialiasingEnable, aa_enable);
    SET(RASTER, raster.CullMode, vk_to_intel_cullmode[dyn->rs.cull_mode]);
    SET(RASTER, raster.FrontWinding, vk_to_intel_front_face[dyn->rs.front_face]);
@@ -2339,6 +2347,46 @@ compute_mesh_provoking_vertex(const struct brw_mesh_prog_data *mesh_prog_data,
 }
 #endif
 
+#if GFX_VERx10 >= 350
+static inline void
+update_fs_color_offset(struct anv_gfx_dynamic_state *hw_state,
+                       const struct anv_cmd_graphics_state *gfx)
+{
+   const struct brw_fs_prog_data *fs_prog_data = get_gfx_fs_prog_data(gfx);
+   if (fs_prog_data == NULL || !fs_prog_data->uses_fs_color_offset)
+      return;
+
+   SET(FS_COLOR_OFFSET, fs_color_offset, gfx->att_states.offset);
+}
+
+static inline void
+update_fs_color_map(struct anv_gfx_dynamic_state *hw_state,
+                    const struct vk_dynamic_graphics_state *dyn,
+                    const struct anv_cmd_graphics_state *gfx)
+{
+   const struct brw_fs_prog_data *fs_prog_data = get_gfx_fs_prog_data(gfx);
+   if (fs_prog_data == NULL || !fs_prog_data->uses_fs_color_map)
+      return;
+
+    /* The surface states are layed out this way :
+     *   - null surface
+     *   - color attachment 0
+     *   - color attachment 1
+     *   - ...
+     *
+     * Hence we leave 0 if MESA_VK_ATTACHMENT_UNUSED and otherwise add 1 to
+     * the index.
+     */
+   uint32_t map = 0;
+   for (uint32_t i = 0; i < MAX_RTS; i++) {
+      if (dyn->cal.color_map[i] != MESA_VK_ATTACHMENT_UNUSED)
+         map |= (1 + i) << (dyn->cal.color_map[i] * 4);
+   }
+
+   SET(FS_COLOR_MAP, fs_color_map, map);
+}
+#endif
+
 /**
  * This function takes the vulkan runtime values & dirty states and updates
  * the values in anv_gfx_dynamic_state, flagging HW instructions for
@@ -2372,6 +2420,18 @@ cmd_buffer_flush_gfx_runtime_state(struct anv_gfx_dynamic_state *hw_state,
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RS_CONSERVATIVE_MODE) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_FSR))
       update_fs_config(hw_state, dyn, gfx);
+
+#if GFX_VERx10 >= 350
+   if (device->physical->uses_efficient_64bit) {
+      if (gfx->dirty & (ANV_CMD_DIRTY_PS |
+                        ANV_CMD_DIRTY_RENDER_TARGETS))
+         update_fs_color_offset(hw_state, gfx);
+
+      if ((gfx->dirty & ANV_CMD_DIRTY_PS) ||
+          BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP))
+         update_fs_color_map(hw_state, dyn, gfx);
+   }
+#endif
 
    if (gfx->dirty & ANV_CMD_DIRTY_PRERASTER_SHADERS)
       update_urb_config(hw_state, gfx, device);
@@ -2477,7 +2537,7 @@ cmd_buffer_flush_gfx_runtime_state(struct anv_gfx_dynamic_state *hw_state,
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RS_DEPTH_CLIP_ENABLE) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RS_CONSERVATIVE_MODE))
-      update_clip_raster(hw_state, dyn, gfx);
+      update_clip_raster(hw_state, device, dyn, gfx);
 
    if (gfx->dirty & ANV_CMD_DIRTY_PRERASTER_SHADERS)
       update_clip_preraster_stages(hw_state, gfx);
@@ -2965,8 +3025,17 @@ cmd_buffer_repack_gfx_state(struct anv_gfx_dynamic_state *hw_state,
          GENX(SF_CLIP_VIEWPORT_pack)(NULL, sf_clip_state.map + i * 64, &sfv);
       }
 
-      anv_gfx_pack(sf_clip, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_SF_CLIP), clip) {
-         clip.SFClipViewportPointer = sf_clip_state.offset;
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_gfx_pack(sf_clip, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_SF_CLIP_2), clip) {
+            clip.SFClipViewportPointer = anv_cmd_buffer_dynamic_state_address(
+               cmd_buffer, sf_clip_state);
+         }
+#endif
+      } else  {
+         anv_gfx_pack(sf_clip, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_SF_CLIP), clip) {
+            clip.SFClipViewportPointer = sf_clip_state.offset;
+         }
       }
    }
 
@@ -2984,9 +3053,19 @@ cmd_buffer_repack_gfx_state(struct anv_gfx_dynamic_state *hw_state,
                                 &cc_viewport);
       }
 
-      anv_gfx_pack(cc_viewport,
-                   GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC), cc) {
-         cc.CCViewportPointer = hw_state->vp_cc.state.offset;
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_gfx_pack(cc_viewport,
+                      GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC_2), cc) {
+            cc.CCViewportPointer = anv_cmd_buffer_dynamic_state_address(
+               cmd_buffer, hw_state->vp_cc.state);
+         }
+#endif
+      } else {
+         anv_gfx_pack(cc_viewport,
+                      GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC), cc) {
+            cc.CCViewportPointer = hw_state->vp_cc.state.offset;
+         }
       }
    }
 
@@ -3012,8 +3091,17 @@ cmd_buffer_repack_gfx_state(struct anv_gfx_dynamic_state *hw_state,
          GENX(SCISSOR_RECT_pack)(NULL, scissor_state.map + i * 8, &scissor);
       }
 
-      anv_gfx_pack(scissor, GENX(3DSTATE_SCISSOR_STATE_POINTERS), ssp) {
-         ssp.ScissorRectPointer = scissor_state.offset;
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_gfx_pack(scissor, GENX(3DSTATE_SCISSOR_STATE_POINTERS_2), ssp) {
+            ssp.ScissorRectPointer = anv_cmd_buffer_dynamic_state_address(
+               cmd_buffer, scissor_state);
+         }
+#endif
+      } else {
+         anv_gfx_pack(scissor, GENX(3DSTATE_SCISSOR_STATE_POINTERS), ssp) {
+            ssp.ScissorRectPointer = scissor_state.offset;
+         }
       }
    }
 
@@ -3074,11 +3162,11 @@ cmd_buffer_repack_gfx_state(struct anv_gfx_dynamic_state *hw_state,
           * will need to be updated accordingly.
           */
          raster.ForcedSampleCount = FSC_NUMRASTSAMPLES_0;
-         raster.ForceMultisampling = false;
          raster.ScissorRectangleEnable = true;
 
          SET(raster, raster, APIMode);
          SET(raster, raster, DXMultisampleRasterizationEnable);
+         SET(raster, raster, ForceMultisampling);
          SET(raster, raster, AntialiasingEnable);
          SET(raster, raster, CullMode);
          SET(raster, raster, FrontWinding);
@@ -3270,9 +3358,19 @@ cmd_buffer_repack_gfx_state(struct anv_gfx_dynamic_state *hw_state,
       };
       GENX(COLOR_CALC_STATE_pack)(NULL, hw_state->cc.state.map, &cc);
 
-      anv_gfx_pack(cc_state, GENX(3DSTATE_CC_STATE_POINTERS), ccp) {
-         ccp.ColorCalcStatePointer = hw_state->cc.state.offset;
-         ccp.ColorCalcStatePointerValid = true;
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_gfx_pack(cc_state, GENX(3DSTATE_CC_STATE_POINTERS_2), ccp) {
+            ccp.ColorCalcStatePointer = anv_cmd_buffer_dynamic_state_address(
+               cmd_buffer, hw_state->cc.state);
+            ccp.ColorCalcStatePointerValid = true;
+         }
+#endif
+      } else {
+         anv_gfx_pack(cc_state, GENX(3DSTATE_CC_STATE_POINTERS), ccp) {
+            ccp.ColorCalcStatePointer = hw_state->cc.state.offset;
+            ccp.ColorCalcStatePointerValid = true;
+         }
       }
    }
 
@@ -3323,9 +3421,19 @@ cmd_buffer_repack_gfx_state(struct anv_gfx_dynamic_state *hw_state,
          dws += GENX(BLEND_STATE_ENTRY_length);
       }
 
-      anv_gfx_pack(blend_state, GENX(3DSTATE_BLEND_STATE_POINTERS), bsp) {
-         bsp.BlendStatePointer      = hw_state->blend.state.offset;
-         bsp.BlendStatePointerValid = true;
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_gfx_pack(blend_state, GENX(3DSTATE_BLEND_STATE_POINTERS_2), bsp) {
+            bsp.BlendStatePointer      = anv_cmd_buffer_dynamic_state_address(
+               cmd_buffer, hw_state->blend.state);
+            bsp.BlendStatePointerValid = true;
+         }
+#endif
+      } else {
+         anv_gfx_pack(blend_state, GENX(3DSTATE_BLEND_STATE_POINTERS), bsp) {
+            bsp.BlendStatePointer      = hw_state->blend.state.offset;
+            bsp.BlendStatePointerValid = true;
+         }
       }
    }
 
@@ -3711,6 +3819,13 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
 
 #define IS_DIRTY(name) BITSET_TEST(hw_state->emit_dirty, ANV_GFX_STATE_##name)
 
+#if INTEL_WA_14024997852_GFX_VER
+   if (IS_DIRTY(WA_14024997852) &&
+       intel_needs_workaround(device->info, 14024997852)) {
+      genX(setup_autostrip_state)(cmd_buffer, !hw_state->autostrip_disabled);
+   }
+#endif
+
    /*
     * Values provided by push constants
     */
@@ -3722,18 +3837,25 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
       gfx->base->push_constants_state = ANV_STATE_NULL;
    }
 
-#if INTEL_WA_14024997852_GFX_VER
-   if (IS_DIRTY(WA_14024997852) &&
-       intel_needs_workaround(device->info, 14024997852)) {
-      genX(setup_autostrip_state)(cmd_buffer, !hw_state->autostrip_disabled);
-   }
-#endif
-
    if (IS_DIRTY(FS_CONFIG)) {
       push_consts->drv_data.gfx.fs_config = hw_state->fs_config;
       cmd_buffer->state.push_constants_dirty |= VK_SHADER_STAGE_FRAGMENT_BIT;
       gfx->base->push_constants_state = ANV_STATE_NULL;
    }
+
+#if GFX_VERx10 >= 350
+   if (IS_DIRTY(FS_COLOR_OFFSET)) {
+      push_consts->drv_data.gfx.fs_color_offset = hw_state->fs_color_offset;
+      cmd_buffer->state.push_constants_dirty |= VK_SHADER_STAGE_FRAGMENT_BIT;
+      gfx->base->push_constants_state = ANV_STATE_NULL;
+   }
+
+   if (IS_DIRTY(FS_COLOR_MAP)) {
+      push_consts->drv_data.gfx.fs_color_map = hw_state->fs_color_map;
+      cmd_buffer->state.push_constants_dirty |= VK_SHADER_STAGE_FRAGMENT_BIT;
+      gfx->base->push_constants_state = ANV_STATE_NULL;
+   }
+#endif
 
 #if INTEL_WA_18019110168_GFX_VER
    if (IS_DIRTY(WA_18019110168)) {
@@ -3907,16 +4029,36 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
       anv_batch_emit_gfx(batch, GENX(3DSTATE_STREAMOUT), so);
    }
 
-   if (IS_DIRTY(VIEWPORT_SF_CLIP))
-      anv_batch_emit_gfx(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_SF_CLIP), sf_clip);
+   if (IS_DIRTY(VIEWPORT_SF_CLIP)) {
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_SF_CLIP_2), sf_clip);
+#endif
+      } else {
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_SF_CLIP), sf_clip);
+      }
+   }
 
    if (IS_DIRTY(VIEWPORT_CC)) {
-      anv_batch_emit_gfx(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC), cc_viewport);
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC_2), cc_viewport);
+#endif
+      } else {
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC), cc_viewport);
+      }
       cmd_buffer->state.gfx.viewport_set = true;
    }
 
-   if (IS_DIRTY(SCISSOR))
-      anv_batch_emit_gfx(batch, GENX(3DSTATE_SCISSOR_STATE_POINTERS), scissor);
+   if (IS_DIRTY(SCISSOR)) {
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_SCISSOR_STATE_POINTERS_2), scissor);
+#endif
+      } else {
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_SCISSOR_STATE_POINTERS), scissor);
+      }
+   }
 
    if (IS_DIRTY(VF_TOPOLOGY))
       anv_batch_emit_gfx(batch, GENX(3DSTATE_VF_TOPOLOGY), vft);
@@ -3972,8 +4114,15 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
    if (IS_DIRTY(MULTISAMPLE))
       anv_batch_emit_gfx(batch, GENX(3DSTATE_MULTISAMPLE), ms);
 
-   if (IS_DIRTY(CC_STATE))
-      anv_batch_emit_gfx(batch, GENX(3DSTATE_CC_STATE_POINTERS), cc_state);
+   if (IS_DIRTY(CC_STATE)) {
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_CC_STATE_POINTERS_2), cc_state);
+#endif
+      } else {
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_CC_STATE_POINTERS), cc_state);
+      }
+   }
 
    if (IS_DIRTY(SAMPLE_MASK))
       anv_batch_emit_gfx(batch, GENX(3DSTATE_SAMPLE_MASK), sm);
@@ -4029,8 +4178,15 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
    if (IS_DIRTY(PS_BLEND))
       anv_batch_emit_gfx(batch, GENX(3DSTATE_PS_BLEND), ps_blend);
 
-   if (IS_DIRTY(BLEND_STATE))
-      anv_batch_emit_gfx(batch, GENX(3DSTATE_BLEND_STATE_POINTERS), blend_state);
+   if (IS_DIRTY(BLEND_STATE)) {
+      if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
+#if GFX_VERx10 >= 350
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_BLEND_STATE_POINTERS_2), blend_state);
+#endif
+      } else {
+         anv_batch_emit_gfx(batch, GENX(3DSTATE_BLEND_STATE_POINTERS), blend_state);
+      }
+   }
 
 #if INTEL_WA_18019816803_GFX_VER
    if (IS_DIRTY(WA_18019816803)) {

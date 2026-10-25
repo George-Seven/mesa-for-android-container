@@ -112,7 +112,6 @@ bool anv_nir_apply_pipeline_layout(nir_shader *shader,
                                    enum brw_robustness_flags robust_flags,
                                    struct anv_descriptor_set_layout * const *set_layouts,
                                    uint32_t set_count,
-                                   const uint32_t *dynamic_offset_start,
                                    bool device_bindable,
                                    struct anv_pipeline_bind_map *map,
                                    struct anv_pipeline_push_map *push_map,
@@ -129,6 +128,8 @@ struct anv_nir_push_layout_info {
    bool separate_tessellation;
    bool fragment_dynamic;
    bool mesh_dynamic;
+   bool use_fs_color_offset;
+   bool use_fs_color_map;
 };
 
 bool anv_nir_shrink_push_constant_ranges(nir_shader *nir);
@@ -220,6 +221,12 @@ void anv_nir_analyze_push_constants_ranges(nir_shader *nir,
                                            struct anv_push_range out_ranges[4]);
 
 enum anv_pipeline_behavior anv_nir_clear_shader_analysis(nir_shader *shader);
+
+nir_def *anv_resinfo(nir_builder *b, const struct intel_device_info *devinfo,
+                     nir_def *surface_state,
+                     nir_def *load, nir_def *nr_comps,
+                     nir_def *dim, nir_def *is_array,
+                     bool is_indirect);
 
 #ifdef __cplusplus
 }

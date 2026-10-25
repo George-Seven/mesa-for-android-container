@@ -37,6 +37,7 @@
 #include "main/hash.h"
 #include "main/mtypes.h"
 #include "nir/nir_xfb_info.h"
+#include "nir/nir_draw_helpers.h"
 #include "nir/pipe_nir.h"
 #include "program/prog_parameter.h"
 #include "program/prog_print.h"
@@ -50,7 +51,6 @@
 
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
-#include "pipe/p_shader_tokens.h"
 #include "draw/draw_context.h"
 #include "draw/draw_nir.h"
 
@@ -105,7 +105,7 @@ set_affected_state_flags(struct gl_program *prog,
  * This determines which states will be updated when the shader is bound.
  */
 void
-st_set_prog_affected_state_flags(struct gl_program *prog)
+st_set_prog_affected_state_flags(struct st_context *st, struct gl_program *prog)
 {
    BITSET_ZERO(prog->affected_states);
 
@@ -149,6 +149,11 @@ st_set_prog_affected_state_flags(struct gl_program *prog)
                                ST_NEW_TES_UBOS,
                                ST_NEW_TES_SSBOS,
                                ST_NEW_TES_ATOMICS);
+
+      /* The tess eval output primitive feeds the reduced primitive the FS
+       * sees for emulated polygon stipple.
+       */
+      ST_SET_STATES(prog->affected_states, st->ctx->DriverFlags.NewStippleEmulate);
       break;
 
    case MESA_SHADER_GEOMETRY:
@@ -163,6 +168,11 @@ st_set_prog_affected_state_flags(struct gl_program *prog)
                                ST_NEW_GS_UBOS,
                                ST_NEW_GS_SSBOS,
                                ST_NEW_GS_ATOMICS);
+
+      /* The geometry shader output primitive feeds the reduced primitive the FS
+       * sees for emulated polygon stipple.
+       */
+      ST_SET_STATES(prog->affected_states, st->ctx->DriverFlags.NewStippleEmulate);
       break;
 
    case MESA_SHADER_FRAGMENT:
@@ -178,6 +188,12 @@ st_set_prog_affected_state_flags(struct gl_program *prog)
                                ST_NEW_FS_UBOS,
                                ST_NEW_FS_SSBOS,
                                ST_NEW_FS_ATOMICS);
+
+      /* Emulated polygon stipple appends a texture/sampler that isn't part of
+       * the shader's own resources, so make sure those atoms are always
+       * considered active for this shader (even if it otherwise uses no textures).
+       */
+      ST_SET_STATES(prog->affected_states, st->ctx->DriverFlags.NewStippleEmulate);
       break;
 
    case MESA_SHADER_COMPUTE:
@@ -642,8 +658,6 @@ static const struct nir_shader_compiler_options draw_nir_options = {
    .lower_extract_word = true,
    .lower_insert_byte = true,
    .lower_insert_word = true,
-   .lower_uadd_carry = true,
-   .lower_usub_borrow = true,
    .lower_mul_2x32_64 = true,
    .lower_ifind_msb = true,
    .lower_int64_options = nir_lower_imul_2x32_64,
@@ -847,6 +861,7 @@ st_create_common_variant(struct st_context *st,
       tex_opts.saturate_s = key->gl_clamp[0];
       tex_opts.saturate_t = key->gl_clamp[1];
       tex_opts.saturate_r = key->gl_clamp[2];
+      tex_opts.saturate_lod_zero = key->gl_clamp[3];
       NIR_PASS(finalize, state.ir.nir, nir_lower_tex, &tex_opts);
    }
 
@@ -1012,6 +1027,11 @@ st_translate_fragment_program(struct st_context *st,
          ST_SET_STATE2(prog->affected_states, ST_NEW_FS_SAMPLER_VIEWS,
                        ST_NEW_FS_SAMPLERS);
    }
+   /* Emulated polygon stipple appends a texture/sampler that isn't part of
+    * the shader's own resources, so make sure those atoms are always
+    * considered active for this shader (even if it otherwise uses no textures).
+    */
+   ST_SET_STATES(prog->affected_states, st->ctx->DriverFlags.NewStippleEmulate);
 
    /* Translate to NIR. */
    if (prog->nir && prog->arb.Instructions)
@@ -1129,6 +1149,7 @@ st_create_fp_variant(struct st_context *st,
       tex_opts.saturate_s = key->gl_clamp[0];
       tex_opts.saturate_t = key->gl_clamp[1];
       tex_opts.saturate_r = key->gl_clamp[2];
+      tex_opts.saturate_lod_zero = key->gl_clamp[3];
       NIR_PASS(finalize, state.ir.nir, nir_lower_tex, &tex_opts);
    }
 
@@ -1180,6 +1201,23 @@ st_create_fp_variant(struct st_context *st,
       finalize = true;
    }
 
+   /* Emulated polygon stipple: sample a stipple texture and discard the
+    * fragment when the corresponding bit is off.  The lowering picks the
+    * first sampler unit past the highest one already used by the shader; we
+    * remember it so st_atom_texture.c / st_atom_sampler.c can bind the
+    * matching stipple texture/sampler there.
+    */
+   variant->stipple_sampler = -1;
+   if (key->lower_polygon_stipple &&
+      !BITSET_TEST(state.ir.nir->info.samplers_used, PIPE_MAX_SAMPLERS - 1)) {
+      unsigned unit = 0;
+      NIR_PASS(finalize, state.ir.nir, nir_lower_pstipple_fs, &unit, 0,
+               st->screen->caps.fs_position_is_sysval, true /* samplers_as_deref */,
+               nir_type_bool1);
+      variant->stipple_sampler = unit;
+      assert(variant->stipple_sampler < PIPE_MAX_SAMPLERS);
+   }
+
    bool need_lower_tex_src_plane = false;
 
    if (unlikely(key->external.lower_nv12 || key->external.lower_nv21 ||
@@ -1188,7 +1226,8 @@ st_create_fp_variant(struct st_context *st,
                   key->external.lower_yx_xvxu || key->external.lower_xy_vxux ||
                   key->external.lower_ayuv || key->external.lower_xyuv ||
                   key->external.lower_yuv || key->external.lower_yu_yv ||
-                  key->external.lower_yv_yu || key->external.lower_y41x)) {
+                  key->external.lower_yv_yu || key->external.lower_y41x ||
+                  key->external.external_y2y)) {
 
       st_nir_lower_samplers(st->screen, state.ir.nir,
                               fp->shader_program, fp);
@@ -1212,6 +1251,7 @@ st_create_fp_variant(struct st_context *st,
       options.bt709_external = key->external.bt709;
       options.bt2020_external = key->external.bt2020;
       options.yuv_full_range_external = key->external.yuv_full_range;
+      options.bypass_csc_external = key->external.external_y2y;
       NIR_PASS(_, state.ir.nir, nir_lower_tex, &options);
       finalize = true;
       need_lower_tex_src_plane = true;
@@ -1306,7 +1346,7 @@ st_get_fp_variant(struct st_context *st,
 
       if (fp->variants != NULL) {
          _mesa_perf_debug(st->ctx, MESA_DEBUG_SEVERITY_MEDIUM,
-                          "Compiling fragment shader variant (%s%s%s%s%s%s%s%s%s%s%s%s%s%d)",
+                          "Compiling fragment shader variant (%s%s%s%s%s%s%s%s%s%s%s%s%s%s%d)",
                           key->bitmap ? "bitmap," : "",
                           key->drawpixels ? "drawpixels," : "",
                           key->scaleAndBias ? "scale_bias," : "",
@@ -1317,6 +1357,7 @@ st_get_fp_variant(struct st_context *st,
                           key->lower_two_sided_color ? "twoside," : "",
                           key->lower_flatshade ? "flatshade," : "",
                           key->lower_alpha_func != COMPARE_FUNC_ALWAYS ? "alpha_compare," : "",
+                          key->lower_polygon_stipple ? "pstipple," : "",
                           /* skipped ATI_fs targets */
                           fp->ExternalSamplersUsed ? "external?," : "",
                           key->gl_clamp[0] || key->gl_clamp[1] || key->gl_clamp[2] ? "GL_CLAMP," : "",

@@ -167,11 +167,9 @@ VA_DRIVER_INIT_FUNC(VADriverContextP ctx)
          drv->vscreen = vl_dri3_screen_create(ctx->native_dpy, ctx->x11_screen);
       /* PRoot exposes KGSL but no DRM render node.  When the normal X11
        * DRI3 path cannot obtain a render device, let the termux-va bridge
-       * create its KGSL screen directly instead of falling back to swrast. */
+       * create its screen directly. */
       if (!drv->vscreen && tva_bridge_active())
          drv->vscreen = tva_bridge_vscreen_create(-1, false);
-      if (!drv->vscreen)
-         drv->vscreen = vl_xlib_swrast_screen_create(ctx->native_dpy, ctx->x11_screen);
       break;
    case VA_DISPLAY_WAYLAND:
    case VA_DISPLAY_DRM:
@@ -204,10 +202,14 @@ VA_DRIVER_INIT_FUNC(VADriverContextP ctx)
           * so don't try to override them.
           */
          bool honor_dri_prime = ctx->display_type == VA_DISPLAY_WAYLAND;
+         bool use_zink = false;
+#ifdef GALLIUM_ZINK
+         use_zink = zink;
+#endif
          if (tva_bridge_active())
             drv->vscreen = tva_bridge_vscreen_create(drm_fd, honor_dri_prime);
          else
-            drv->vscreen = vl_drm_screen_create(drm_fd, honor_dri_prime);
+            drv->vscreen = vl_drm_screen_create(drm_fd, honor_dri_prime, use_zink);
       }
       break;
    }
@@ -468,10 +470,6 @@ vlVaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width,
       break;
    }
 
-   mtx_init(&context->mutex, mtx_plain);
-   context->surfaces = _mesa_set_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
-   context->buffers = _mesa_set_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
-
    mtx_lock(&drv->mutex);
    *context_id = handle_table_add(drv->htab, context);
    mtx_unlock(&drv->mutex);
@@ -488,6 +486,7 @@ vlVaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width,
          *context_id = VA_INVALID_ID;
          return VA_STATUS_ERROR_ALLOCATION_FAILED;
       }
+      pipe_reference_init(&context->decoder->reference, 1);
    }
 
    fprintf(stderr, "tva-va: create context success id=%u decoder=%p\n",
@@ -517,34 +516,9 @@ vlVaDestroyContext(VADriverContextP ctx, VAContextID context_id)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
    }
 
-   mtx_lock(&context->mutex);
-
-   /* Exported dma-bufs may outlive this context. Finish the bridge's pending
-    * CPU copies before releasing their fences and stopping its reader. */
+   /* Exported dma-bufs may outlive this context. Complete the bridge's
+    * pending CPU copies before dropping the context's codec reference. */
    tva_bridge_finish_decode(context->decoder);
-
-   set_foreach(context->surfaces, entry) {
-      vlVaSurface *surf = (vlVaSurface *)entry->key;
-      assert(surf->ctx == context);
-      surf->ctx = NULL;
-      if (surf->fence && context->decoder && context->decoder->destroy_fence) {
-         context->decoder->destroy_fence(context->decoder, surf->fence);
-         surf->fence = NULL;
-      }
-   }
-   _mesa_set_destroy(context->surfaces, NULL);
-
-   set_foreach(context->buffers, entry) {
-      vlVaBuffer *buf = (vlVaBuffer *)entry->key;
-      assert(buf->ctx == context);
-      vlVaGetBufferFeedback(buf);
-      buf->ctx = NULL;
-      if (buf->fence && context->decoder && context->decoder->destroy_fence) {
-         context->decoder->destroy_fence(context->decoder, buf->fence);
-         buf->fence = NULL;
-      }
-   }
-   _mesa_set_destroy(context->buffers, NULL);
 
    bool is_encode = context->desc.base.entry_point == PIPE_VIDEO_ENTRYPOINT_ENCODE;
    switch (u_reduce_video_profile(context->desc.base.profile)) {
@@ -553,9 +527,17 @@ vlVaDestroyContext(VADriverContextP ctx, VAContextID context_id)
          if (context->desc.h264enc.frame_idx)
             _mesa_hash_table_destroy(context->desc.h264enc.frame_idx, NULL);
          for (uint32_t i = 0; i < ARRAY_SIZE(context->desc.h264enc.dpb); i++) {
-            struct pipe_video_buffer *buf = context->desc.h264enc.dpb[i].buffer;
-            if (buf && !context->desc.h264enc.dpb[i].id)
-               buf->destroy(buf);
+            uint32_t id = context->desc.h264enc.dpb[i].id;
+            if (id) {
+               vlVaSurface *surf = handle_table_get(drv->htab, id);
+               assert(surf);
+               surf->dpb_id = NULL;
+               surf->dpb_buffer = NULL;
+            } else {
+               struct pipe_video_buffer *buf = context->desc.h264enc.dpb[i].buffer;
+               if (buf)
+                  buf->destroy(buf);
+            }
          }
          util_dynarray_fini(&context->desc.h264enc.raw_headers);
       } else {
@@ -569,9 +551,17 @@ vlVaDestroyContext(VADriverContextP ctx, VAContextID context_id)
          if (context->desc.h265enc.frame_idx)
             _mesa_hash_table_destroy(context->desc.h265enc.frame_idx, NULL);
          for (uint32_t i = 0; i < ARRAY_SIZE(context->desc.h265enc.dpb); i++) {
-            struct pipe_video_buffer *buf = context->desc.h265enc.dpb[i].buffer;
-            if (buf && !context->desc.h265enc.dpb[i].id)
-               buf->destroy(buf);
+            uint32_t id = context->desc.h265enc.dpb[i].id;
+            if (id) {
+               vlVaSurface *surf = handle_table_get(drv->htab, id);
+               assert(surf);
+               surf->dpb_id = NULL;
+               surf->dpb_buffer = NULL;
+            } else {
+               struct pipe_video_buffer *buf = context->desc.h265enc.dpb[i].buffer;
+               if (buf)
+                  buf->destroy(buf);
+            }
          }
          util_dynarray_fini(&context->desc.h265enc.raw_headers);
       } else {
@@ -583,9 +573,17 @@ vlVaDestroyContext(VADriverContextP ctx, VAContextID context_id)
    case PIPE_VIDEO_FORMAT_AV1:
       if (is_encode) {
          for (uint32_t i = 0; i < ARRAY_SIZE(context->desc.av1enc.dpb); i++) {
-            struct pipe_video_buffer *buf = context->desc.av1enc.dpb[i].buffer;
-            if (buf && !context->desc.av1enc.dpb[i].id)
-               buf->destroy(buf);
+            uint32_t id = context->desc.av1enc.dpb[i].id;
+            if (id) {
+               vlVaSurface *surf = handle_table_get(drv->htab, id);
+               assert(surf);
+               surf->dpb_id = NULL;
+               surf->dpb_buffer = NULL;
+            } else {
+               struct pipe_video_buffer *buf = context->desc.av1enc.dpb[i].buffer;
+               if (buf)
+                  buf->destroy(buf);
+            }
          }
          util_dynarray_fini(&context->desc.av1enc.raw_headers);
       }
@@ -595,14 +593,11 @@ vlVaDestroyContext(VADriverContextP ctx, VAContextID context_id)
       break;
    }
 
-   if (context->decoder)
-      context->decoder->destroy(context->decoder);
+   pipe_video_codec_reference(&context->decoder, NULL);
    if (context->deint) {
       vl_deint_filter_cleanup(context->deint);
       FREE(context->deint);
    }
-   mtx_unlock(&context->mutex);
-   mtx_destroy(&context->mutex);
    FREE(context->desc.base.decrypt_key);
    util_dynarray_fini(&context->bs.buffers);
    util_dynarray_fini(&context->bs.sizes);
@@ -622,8 +617,7 @@ vlVaTerminate(VADriverContextP ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
    drv = ctx->pDriverData;
-   if (drv->proc)
-      drv->proc->destroy(drv->proc);
+   pipe_video_codec_reference(&drv->proc, NULL);
    if (drv->pipe2)
       drv->pipe2->destroy(drv->pipe2);
    drv->pipe->destroy(drv->pipe);

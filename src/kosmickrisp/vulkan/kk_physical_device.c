@@ -17,6 +17,7 @@
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/ns_process_info.h"
+#include "kosmickrisp/compiler/nir_to_msl.h"
 
 #include "util/disk_cache.h"
 #include "util/mesa-blake3.h"
@@ -142,6 +143,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
 
       /* Optional extensions */
       .KHR_calibrated_timestamps = true,
+      .KHR_deferred_host_operations = true,
       .KHR_maintenance7 = true,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
@@ -266,11 +268,7 @@ kk_get_device_features(
       .samplerYcbcrConversion = true,
       .shaderDrawParameters = true,
       .storageBuffer16BitAccess = true,
-      /* TODO KOSMICKRISP
-       * Disabled due to failing tests (TCS/TES patch I/O):
-       * dEQP-VK.tessellation.tess_io.max_in_out.with_f16.*.tcs_patch_*reads*
-       */
-      .storageInputOutput16 = false,
+      .storageInputOutput16 = true,
       .storagePushConstant16 = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .variablePointers = true,
@@ -537,6 +535,13 @@ kk_get_device_properties(
    float timestamp_period =
       timestamp_frequency ? (1000000000.0f / (float)timestamp_frequency) : 1.0f;
 
+   /* M1 and M2 are restricted to 1024 unique samplers, so there we advertise
+    * the minimum allowed by spec. Otherwise, we advertise the maximum that fit
+    * in our sampler table. */
+   uint32_t max_samplers = pdev->info.max_sampler_count >= MSL_MAX_SAMPLERS
+                              ? MSL_MAX_SAMPLERS
+                              : 4000;
+
    *properties = (struct vk_properties){
       .apiVersion = kk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
@@ -558,7 +563,7 @@ kk_get_device_properties(
       .maxStorageBufferRange = UINT32_MAX,
       .maxPushConstantsSize = KK_MAX_PUSH_SIZE,
       .maxMemoryAllocationCount = 4096,
-      .maxSamplerAllocationCount = 4000,
+      .maxSamplerAllocationCount = max_samplers,
       .bufferImageGranularity = 16,
       .sparseAddressSpaceSize = KK_SPARSE_ADDR_SPACE_SIZE,
       .maxBoundDescriptorSets = KK_MAX_SETS,
@@ -694,7 +699,7 @@ kk_get_device_properties(
       .independentResolveNone = true,
       .independentResolve = true,
       .driverID = VK_DRIVER_ID_MESA_KOSMICKRISP,
-      .conformanceVersion = (VkConformanceVersion){1, 4, 3, 2},
+      .conformanceVersion = (VkConformanceVersion){1, 4, 6, 2},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
       .shaderSignedZeroInfNanPreserveFloat16 = true,
@@ -777,7 +782,7 @@ kk_get_device_properties(
       .advancedBlendAllOperations = true,
 
       /* VK_EXT_custom_border_color */
-      .maxCustomBorderColorSamplers = 4000,
+      .maxCustomBorderColorSamplers = max_samplers,
 
       /* VK_EXT_extended_dynamic_state3 */
       .dynamicPrimitiveTopologyUnrestricted = false,
@@ -1106,12 +1111,18 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
       settings->disabled_workarounds |= BITFIELD64_BIT(11);
       settings->disabled_workarounds |= BITFIELD64_BIT(12);
       settings->disabled_workarounds |= BITFIELD64_BIT(17);
+      settings->disabled_workarounds |= BITFIELD64_BIT(18);
    }
-   /* M5-only workarounds */
+   /* M5 only workarounds */
+   if (pdev->info.gpu_apple_family >= 10) {
+      settings->disabled_workarounds &= ~BITFIELD64_BIT(2);
+   }
    if (pdev->info.gpu_apple_family < 10) {
       settings->disabled_workarounds |= BITFIELD64_BIT(16);
-   } else {
-      settings->disabled_workarounds &= ~BITFIELD64_BIT(2);
+   }
+   /* M3+ only workarounds */
+   if (pdev->info.gpu_apple_family < 9) {
+      settings->disabled_workarounds |= BITFIELD64_BIT(18);
    }
 }
 

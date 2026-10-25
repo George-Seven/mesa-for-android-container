@@ -108,7 +108,6 @@ endif
 
 rusticl_bindgen_args = [
   bindgen_output_args,
-  '--raw-line', '#![allow(warnings)]',
   '--no-convert-floats',
   '--default-enum-style', 'rust',
   '--with-derive-partialeq',
@@ -309,6 +308,8 @@ rusticl_mesa_bindings = rust.bindgen(
     '--allowlist-function',     'nir_.*',
     '--allowlist-var',          'nir_debug',
     '--allowlist-var',          'NIR_DEBUG_.*',
+    '--bitfield-enum',          'nir_float_muladd_support',
+    '--bitfield-enum',          'nir_lower_doubles_options',
     '--bitfield-enum',          'nir_lower_int64_options',
     '--bitfield-enum',          'nir_opt_if_options',
     '--bitfield-enum',          'nir_variable_mode',
@@ -321,6 +322,7 @@ rusticl_mesa_bindings = rust.bindgen(
     '--allowlist-var',          'PIPE_.*',
     '--allowlist-type',         'pipe_endian',
     '--bitfield-enum',          'pipe_map_flags',
+    '--bitfield-enum',          'pipe_query_flags',
     '--allowlist-type',         'pipe_query_type',
     '--constified-enum-module', 'pipe_query_type',
     '--allowlist-type',         'pipe_resource_usage',

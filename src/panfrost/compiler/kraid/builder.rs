@@ -59,6 +59,23 @@ pub trait Builder {
         });
     }
 
+    fn f32_to_f16_to(&mut self, mut dst: Dst, src: Src, round: FRound) {
+        debug_assert_eq!(dst.dst_ref.bytes_written(), 2);
+        dst.lanes = DstLanes::AnyHF;
+        let neutral_src = if round != FRound::Down {
+            Src::fneg_zero(32)
+        } else {
+            Src::zero(32)
+        };
+        self.push_op(OpFAdd {
+            dst,
+            dst_type: DataType::F32,
+            round,
+            clamp: FClamp::None,
+            srcs: [src, neutral_src],
+        });
+    }
+
     fn load_tls_to(&mut self, dst: Dst, dst_type: DataType, offset: u16) {
         let tls_ptr = SpecialFAU::ThreadLocalPointer;
         let tls_ptr = self.model().fau().special(tls_ptr).unwrap();
@@ -111,6 +128,12 @@ pub trait SSABuilder: Builder + AllocSSA {
         def
     }
 
+    fn copy_i64(&mut self, src: Src) -> SSARef {
+        let def = self.alloc_ref(64);
+        self.copy_i64_to(def.clone().into(), src);
+        def
+    }
+
     fn copy_ssa(&mut self, src: SSAValue) -> SSAValue {
         let def = self.alloc_ssa(src.bits());
         self.copy_to(def.into(), DataType::i(src.bits()), src.into());
@@ -126,6 +149,12 @@ pub trait SSABuilder: Builder + AllocSSA {
     fn fadd_32(&mut self, a: Src, b: Src) -> SSAValue {
         let def = self.alloc_ssa(32);
         self.fadd_32_to(def.into(), a, b);
+        def
+    }
+
+    fn f32_to_f16(&mut self, a: Src, round: FRound) -> SSAValue {
+        let def = self.alloc_ssa(16);
+        self.f32_to_f16_to(def.into(), a, round);
         def
     }
 
@@ -245,15 +274,15 @@ pub trait SSABuilder: Builder + AllocSSA {
         let bits = dst_type.bits();
         let comps = dst_type.comps();
         debug_assert!(bits == 16 || bits == 32);
-        debug_assert!(bits * comps <= 32);
+        debug_assert!(comps == 1);
 
         let lane = match axis {
             DerivativeAxis::X => 1_u8,
             DerivativeAxis::Y => 2_u8,
         };
 
-        let left = self.alloc_ssa(dst_type.total_bits());
-        let right = self.alloc_ssa(dst_type.total_bits());
+        let left = self.alloc_ssa(32);
+        let right = self.alloc_ssa(32);
         if coarse {
             self.push_op(OpClper {
                 dst: left.into(),
@@ -283,13 +312,23 @@ pub trait SSABuilder: Builder + AllocSSA {
             });
         }
 
-        let diff = self.alloc_ssa(32);
+        // CLPER works in 32-bits, but we actually only need 16 bits
+        let swiz = if bits == 16 {
+            Swizzle::replicate_half(0)
+        } else {
+            Swizzle::NONE
+        };
+
+        let diff = self.alloc_ssa(dst_type.total_bits());
         self.push_op(OpFAdd {
             dst: diff.into(),
             dst_type,
             round: FRound::NearestEven,
             clamp: FClamp::None,
-            srcs: [Src::from(right), Src::from(left).fneg()],
+            srcs: [
+                Src::from(right).swizzle(swiz),
+                Src::from(left).swizzle(swiz).fneg(),
+            ],
         });
 
         if coarse || sign_is_ignored {
@@ -302,7 +341,7 @@ pub trait SSABuilder: Builder + AllocSSA {
         //
         //  sign_bit = XOR(sign_bit, axis_bit(lane_id)).
         let lane = self.model().fau().special(SpecialFAU::LaneId).unwrap();
-        let mut lane = Src::from(lane);
+        let mut lane = Src::from(lane).word(0);
         if bits == 16 {
             lane = lane.half(0);
         }
@@ -316,10 +355,11 @@ pub trait SSABuilder: Builder + AllocSSA {
         // We skip it on the X-axis, because the lshift-by-31 will get us a
         // clean mask.
         if matches!(axis, DerivativeAxis::Y) {
-            lane = self.and(DataType::u(bits), 2_u8.into(), lane).into();
+            let mask = Src::from(2_u32).swizzle(swiz);
+            lane = self.and(DataType::u(bits), mask, lane).into();
         }
 
-        let dst = self.alloc_ssa(32);
+        let dst = self.alloc_ssa(dst_type.total_bits());
         self.push_op(OpShiftLop {
             dst: dst.into(),
             dst_type: DataType::get(comps, NumericType::UnsignedInteger, bits),
@@ -372,6 +412,7 @@ pub trait SSABuilder: Builder + AllocSSA {
         let frexp = self.alloc_ssa(32);
         self.push_op(OpFrexpE {
             dst: frexp.into(),
+            src_type: DataType::F32,
             src: arg.clone(),
             mode: FrexpMode::Log,
             neg_result: false,

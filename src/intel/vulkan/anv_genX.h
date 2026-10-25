@@ -53,9 +53,6 @@ VkResult genX(init_device_state)(struct anv_device *device);
 
 void genX(init_cps_device_state)(struct anv_device *device);
 
-uint32_t genX(call_internal_shader)(nir_builder *b,
-                                    enum anv_internal_kernel_name shader_name);
-
 void genX(cmd_buffer_disable_hiz_planes)(struct anv_cmd_buffer *cmd_buffer);
 
 void
@@ -439,10 +436,6 @@ genX(cmd_buffer_begin_companion_rcs_syncpoint)(struct anv_cmd_buffer *cmd_buffer
 void
 genX(cmd_buffer_end_companion_rcs_syncpoint)(struct anv_cmd_buffer *cmd_buffer,
                                              struct anv_state syncpoint);
-void
-genX(cmd_write_buffer_cp)(struct anv_cmd_buffer *cmd_buffer,
-                          VkDeviceAddress dstAddr,
-                          void *data, uint32_t size);
 
 void
 genX(emit_simple_shader_init)(struct anv_simple_shader *state);
@@ -630,3 +623,5 @@ genX(anv_get_btd_dispatch_timeout_counter)(uint32_t dispatch_timeout_counter)
 
    return clamped_timeout_counter;
 }
+
+uint32_t genX(compute_walker2_get_stack_id_control_value)(const struct anv_device *device);

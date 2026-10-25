@@ -212,7 +212,6 @@ spec@arb_gpu_shader_fp64@execution@built-in-functions@gs-greaterthanequal-dvec3-
 spec@arb_pixel_buffer_object@pbo-drawpixels
 spec@arb_pixel_buffer_object@texsubimage pbo
 spec@arb_pixel_buffer_object@texsubimage-unpack pbo
-spec@arb_sample_locations@test
 spec@arb_sample_shading@builtin-gl-sample-mask 4
 spec@arb_shader_image_load_store@coherency
 spec@arb_shader_image_load_store@coherency@Geometry-Fragment shader/'coherent' qualifier coherency test/256x256
@@ -227,15 +226,7 @@ spec@arb_shader_precision@fs-op-assign-mult-float-float
 spec@arb_shader_precision@gs-radians-float
 spec@arb_shader_precision@vs-op-assign-add-vec4-float
 spec@arb_shader_precision@vs-op-sub-float-vec2
-spec@arb_tessellation_shader@execution@tcs-input-read-nonconst
-spec@arb_tessellation_shader@execution@variable-indexing@tcs-output-array-float-index-wr
-spec@arb_tessellation_shader@execution@variable-indexing@tcs-output-array-float-index-wr-before-barrier
-spec@arb_tessellation_shader@execution@variable-indexing@tcs-output-array-vec2-index-wr
-spec@arb_tessellation_shader@execution@variable-indexing@tcs-output-array-vec2-index-wr-before-barrier
-spec@arb_tessellation_shader@execution@variable-indexing@tcs-output-array-vec3-index-wr
-spec@arb_tessellation_shader@execution@variable-indexing@tcs-output-array-vec3-index-wr-before-barrier
-spec@arb_tessellation_shader@execution@variable-indexing@tcs-output-array-vec4-index-wr
-spec@arb_tessellation_shader@execution@variable-indexing@tcs-output-array-vec4-index-wr-before-barrier
+spec@arb_tessellation_shader@execution
 spec@arb_texture_compression@texwrap formats
 spec@arb_texture_compression@texwrap formats@GL_COMPRESSED_LUMINANCE- NPOT
 spec@arb_texture_compression_bptc@texwrap formats

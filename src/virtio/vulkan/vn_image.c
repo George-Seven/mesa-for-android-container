@@ -54,27 +54,24 @@ static void
 vn_image_fill_reqs(const struct vn_image_memory_requirements *req,
                    VkMemoryRequirements2 *out_reqs)
 {
-   union {
-      VkBaseOutStructure *pnext;
-      VkMemoryRequirements2 *two;
-      VkMemoryDedicatedRequirements *dedicated;
-   } u = { .two = out_reqs };
-
-   while (u.pnext) {
-      switch (u.pnext->sType) {
-      case VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2:
-         u.two->memoryRequirements = req->memory.memoryRequirements;
+   vk_foreach_struct(stype, src, out_reqs) {
+      switch (stype) {
+      case VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2: {
+         VkMemoryRequirements2 *reqs2 = src;
+         reqs2->memoryRequirements = req->memory.memoryRequirements;
          break;
-      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS:
-         u.dedicated->prefersDedicatedAllocation =
+      }
+      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+         VkMemoryDedicatedRequirements *dedicated = src;
+         dedicated->prefersDedicatedAllocation =
             req->dedicated.prefersDedicatedAllocation;
-         u.dedicated->requiresDedicatedAllocation =
+         dedicated->requiresDedicatedAllocation =
             req->dedicated.requiresDedicatedAllocation;
          break;
+      }
       default:
          break;
       }
-      u.pnext = u.pnext->pNext;
    }
 }
 
@@ -482,7 +479,7 @@ vn_image_fix_create_info(
    struct vn_image_create_info *local_info)
 {
    local_info->create = *create_info;
-   VkBaseOutStructure *cur = (void *)&local_info->create;
+   void *cur = (void *)&local_info->create;
 
    vk_foreach_struct_const(sType, src, create_info->pNext) {
       void *next = NULL;
@@ -516,12 +513,12 @@ vn_image_fix_create_info(
       }
 
       if (next) {
-         cur->pNext = next;
+         vk_pnext_set_next(cur, next);
          cur = next;
       }
    }
 
-   cur->pNext = NULL;
+   vk_pnext_set_next(cur, NULL);
 
    return &local_info->create;
 }
@@ -594,9 +591,10 @@ vn_CreateImage(VkDevice device,
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
       result = vn_image_create_deferred(dev, pCreateInfo, alloc, &img);
 #else
+      VkImage img_handle = VK_NULL_HANDLE;
       result = wsi_common_create_swapchain_image(
-         &dev->physical_device->wsi_device, pCreateInfo,
-         (VkImage *)&img);
+         &dev->physical_device->wsi_device, pCreateInfo, &img_handle);
+      img = vn_image_from_handle(img_handle);
 #endif
    } else {
       struct vn_image_create_info local_info;
@@ -674,6 +672,18 @@ vn_GetImageSparseMemoryRequirements2(
       pSparseMemoryRequirements);
 }
 
+static void
+vn_image_fill_bind_memory_status(uint32_t count,
+                                 const VkBindImageMemoryInfo *infos)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      const VkBindMemoryStatus *bind_status =
+         vk_find_struct_const(infos[i].pNext, BIND_MEMORY_STATUS);
+      if (bind_status)
+         *bind_status->pResult = VK_SUCCESS;
+   }
+}
+
 static VkResult
 vn_image_bind_wsi_memory(struct vn_device *dev,
                          uint32_t count,
@@ -711,6 +721,8 @@ vn_image_bind_wsi_memory(struct vn_device *dev,
 
    STACK_ARRAY_FINISH(local_infos);
 
+   vn_image_fill_bind_memory_status(count, infos);
+
    return VK_SUCCESS;
 }
 
@@ -729,12 +741,7 @@ vn_BindImageMemory2(VkDevice device,
    vn_async_vkBindImageMemory2(dev->primary_ring, device, bindInfoCount,
                                pBindInfos);
 
-   for (uint32_t i = 0; i < bindInfoCount; i++) {
-      const VkBindMemoryStatus *bind_status =
-         vk_find_struct((void *)pBindInfos[i].pNext, BIND_MEMORY_STATUS);
-      if (bind_status)
-         *bind_status->pResult = VK_SUCCESS;
-   }
+   vn_image_fill_bind_memory_status(bindInfoCount, pBindInfos);
 
    return VK_SUCCESS;
 }

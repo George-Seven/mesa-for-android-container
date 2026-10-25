@@ -32,7 +32,7 @@ Temp inputs[16];
 static radeon_info rad_info;
 static nir_shader_compiler_options nir_options;
 static nir_builder _nb;
-nir_builder *nb;
+nir_builder* nb;
 
 static VkInstance vk_instance = VK_NULL_HANDLE;
 static VkDevice vk_device = VK_NULL_HANDLE;
@@ -163,7 +163,8 @@ setup_cs(const char* input_spec, enum amd_gfx_level gfx_level, enum radeon_famil
 }
 
 bool
-setup_nir_cs(enum amd_gfx_level gfx_level, mesa_shader_stage stage, enum radeon_family family, const char* subvariant)
+setup_nir_cs(enum amd_gfx_level gfx_level, mesa_shader_stage stage, enum radeon_family family,
+             const char* subvariant)
 {
    if (!set_variant(gfx_level, subvariant))
       return false;
@@ -387,12 +388,14 @@ finish_assembler_test()
 {
    finish_program(program.get());
    std::vector<uint32_t> binary;
-   unsigned exec_size = emit_program(program.get(), binary);
+   std::vector<aco_symbol> symbols;
+   aco_callback_params params = {};
+   emit_program(program.get(), binary, symbols, true, &params);
 
    /* we could use CLRX for disassembly but that would require it to be
     * installed */
    if (program->gfx_level >= GFX8) {
-      print_asm(program.get(), rad_info.family, binary, exec_size / 4u, output);
+      print_asm(program.get(), rad_info.family, binary, params.exec_size / 4u, output);
    } else {
       // TODO: maybe we should use CLRX and skip this test if it's not available?
       for (uint32_t dword : binary)
@@ -401,10 +404,11 @@ finish_assembler_test()
 }
 
 void
-live_var_analysis_debug_func(void* private_data, enum aco_compiler_debug_level level, const char* message)
+live_var_analysis_debug_func(void* private_data, enum aco_compiler_debug_level level,
+                             const char* message)
 {
    if (level == ACO_COMPILER_DEBUG_LEVEL_ERROR)
-      *(bool *)private_data = true;
+      *(bool*)private_data = true;
 }
 
 void
@@ -427,7 +431,8 @@ finish_isel_test(enum ac_hw_stage hw_stage, unsigned wave_size)
    memset(&info, 0, sizeof(info));
    info.hw_stage = hw_stage;
    info.wave_size = wave_size;
-   info.workgroup_size = nb->shader->info.workgroup_size[0] * nb->shader->info.workgroup_size[1] * nb->shader->info.workgroup_size[2];
+   info.workgroup_size = nb->shader->info.workgroup_size[0] * nb->shader->info.workgroup_size[1] *
+                         nb->shader->info.workgroup_size[2];
 
    memset(&config, 0, sizeof(config));
 

@@ -290,6 +290,18 @@ enum ENUM_PACKED lsc_addr_size {
   LSC_ADDR_SIZE_A64 = 3,    /* 64-bit address offset */
 };
 
+enum ENUM_PACKED lsc_addr_type_size {
+   LSC_ADDR_TYPE_SIZE_FLAT_A64_UA32_INDEX = 0,
+   LSC_ADDR_TYPE_SIZE_FLAT_A64_IA32_INDEX = 1,
+   LSC_ADDR_TYPE_SIZE_FLAT_A64_A64_INDEX = 2,
+   LSC_ADDR_TYPE_SIZE_STATEFUL_A32_INDEX = 3,
+};
+
+enum ENUM_PACKED lsc_urb_addr_type_size {
+   LSC_URB_ADDR_TYPE_SIZE_A32_A32_INDEX = 0,
+   LSC_URB_ADDR_TYPE_SIZE_A64 = 1
+};
+
 /*
  * Specifies the type of the address payload item in a dataport message. The
  * address type specifies how the dataport message decodes the Extended
@@ -723,6 +735,13 @@ enum {
    GEN_XE2_RT_WRITE_SUBTYPE_SIMD16_DUALSRC = 2,
 };
 
+/* GFX 35 + 64bits Render target opcodes */
+enum {
+   GFX35_RENDER_TARGET_WRITE             = 6,
+   GFX35_RENDER_TARGET_READ              = 2,
+   GFX35_RENDER_TARGET_DUAL_SOURCE_WRITE = 5,
+};
+
 /* Atomic op codes (msg_ctrl[3:0] of HDC untyped_atomic / similar). */
 enum {
    GEN_AOP_AND     = 1,
@@ -779,6 +798,10 @@ enum {
    GEN_MESSAGE_GATEWAY_SFID_MMIO_READ_WRITE      = 6,
 };
 
+enum gen_gateway_64bit_opcode {
+   GEN_MESSAGE_GATEWAY_64BIT_SFID_SIGNAL_EOT     = 0,
+};
+
 /* Pixel-interpolator msg_type (desc[13:12]). */
 enum {
    GEN_PIXEL_INTERPOLATOR_LOC_SHARED_OFFSET   = 0,
@@ -792,12 +815,25 @@ enum {
    GEN_RT_BTD_MESSAGE_SPAWN  = 1,
 };
 
+enum {
+   GFX35_BTD_MSG_NORMAL_BTD_SPAWN = 0,
+   GFX35_BTD_MSG_STACK_ID_RELEASE = 1,
+};
+
 /* Ray trace accelerator trace-ray control (desc[9:8]). */
 enum {
    GEN_RT_TRACE_RAY_INITIAL   = 0,
    GEN_RT_TRACE_RAY_INSTANCE  = 1,
    GEN_RT_TRACE_RAY_COMMIT    = 2,
    GEN_RT_TRACE_RAY_CONTINUE  = 3,
+};
+
+/* Ray trace accelerator trace-ray control (Gfx35+) */
+enum {
+   GFX35_OP_TRACE_RAY_ASYNC      = 0,
+   GFX35_OP_TRACE_RAY_SYNC       = 1,
+   GFX35_OP_RAYQUERY_CHECK       = 3,
+   GFX35_OP_RAYQUERY_RELEASE     = 4,
 };
 
 /* Bindless thread dispatch shader types. */
@@ -811,4 +847,3 @@ enum {
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
-

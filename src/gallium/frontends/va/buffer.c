@@ -313,7 +313,6 @@ vlVaDestroyBuffer(VADriverContextP ctx, VABufferID buf_id)
 {
    vlVaDriver *drv;
    vlVaBuffer *buf;
-   vlVaContext *context;
 
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -325,10 +324,6 @@ vlVaDestroyBuffer(VADriverContextP ctx, VABufferID buf_id)
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_BUFFER;
    }
-
-   context = buf->ctx;
-   if (context)
-      mtx_lock(&context->mutex);
 
    if (buf->derived_surface.resource)
       pipe_resource_reference(&buf->derived_surface.resource, NULL);
@@ -344,16 +339,13 @@ vlVaDestroyBuffer(VADriverContextP ctx, VABufferID buf_id)
       FREE(buf->data);
    }
 
-   if (context) {
-      assert(_mesa_set_search(context->buffers, buf));
-      _mesa_set_remove_key(context->buffers, buf);
+   if (buf->fence) {
+      assert(buf->codec && buf->codec->destroy_fence);
       vlVaGetBufferFeedback(buf);
-      if (buf->fence && context->decoder && context->decoder->destroy_fence) {
-         context->decoder->destroy_fence(context->decoder, buf->fence);
-         buf->fence = NULL;
-      }
-      mtx_unlock(&context->mutex);
+      if (buf->codec && buf->codec->destroy_fence)
+         buf->codec->destroy_fence(buf->codec, buf->fence);
    }
+   pipe_video_codec_reference(&buf->codec, NULL);
 
    if (buf->coded_surf)
       buf->coded_surf->coded_buf = NULL;
@@ -555,7 +547,6 @@ VAStatus
 vlVaSyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns)
 {
    vlVaDriver *drv;
-   vlVaContext *context;
    vlVaBuffer *buf;
 
    if (!ctx)
@@ -578,32 +569,31 @@ vlVaSyncBuffer(VADriverContextP ctx, VABufferID buf_id, uint64_t timeout_ns)
       return VA_STATUS_SUCCESS;
    }
 
-   context = buf->ctx;
-   if (!context || !context->decoder) {
+   if (!buf->codec) {
       mtx_unlock(&drv->mutex);
       return VA_STATUS_ERROR_INVALID_CONTEXT;
    }
 
-   /* Capture the decoder while both locks are held, then release the context
-    * lock before the potentially blocking callback.  Keeping it held while
-    * drv->mutex is released allows another VA thread to take drv->mutex and
-    * wait on the same context, which deadlocks when this thread reacquires
-    * drv->mutex after fence_wait returns. */
-   mtx_lock(&context->mutex);
-   struct pipe_video_codec *decoder = context->decoder;
-   mtx_unlock(&context->mutex);
+   struct pipe_video_codec *tmp_codec = NULL;
+   pipe_video_codec_reference(&tmp_codec, buf->codec);
+
+   /* Unlock mutex while waiting */
    mtx_unlock(&drv->mutex);
-   int ret = decoder->fence_wait(decoder, buf->fence, timeout_ns);
+
+   int ret = tmp_codec->fence_wait(tmp_codec, buf->fence, timeout_ns);
+   mtx_lock(&drv->mutex);
+   pipe_video_codec_reference(&tmp_codec, NULL);
+   mtx_unlock(&drv->mutex);
    return ret ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_TIMEDOUT;
 }
 #endif
 
 void vlVaGetBufferFeedback(vlVaBuffer *buf)
 {
-   if (!buf->ctx || !buf->ctx->decoder || !buf->feedback)
+   if (!buf->codec || !buf->feedback)
       return;
 
-   buf->ctx->decoder->get_feedback(buf->ctx->decoder, buf->feedback,
-                                   &buf->coded_size, &buf->extended_metadata);
+   buf->codec->get_feedback(buf->codec, buf->feedback,
+                            &buf->coded_size, &buf->extended_metadata);
    buf->feedback = NULL;
 }

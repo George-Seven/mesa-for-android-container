@@ -40,8 +40,8 @@ extern "C" {
  */
 bool tva_bridge_active(void);
 
-/* Complete AVC/HEVC decoder output before VA context teardown drops fences.
- * Called on the application thread with drv->mutex then context->mutex held. */
+/* Complete AVC/HEVC decoder output before VA context teardown releases its
+ * codec reference. Called on the application thread with drv->mutex held. */
 void tva_bridge_finish_decode(struct pipe_video_codec *codec);
 
 /*

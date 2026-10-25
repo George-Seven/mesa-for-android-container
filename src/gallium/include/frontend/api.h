@@ -114,20 +114,6 @@ enum st_attachment_type {
 #define ST_INVALIDATE_SAMPLE_SHADING      (1 << 17)
 #define ST_INVALIDATE_FS_IMAGES           (1 << 18)
 
-/**
- * Value to pipe_frontend_streen::get_param function.
- */
-enum st_manager_param {
-   /**
-    * The DRI frontend on old libGL's doesn't do the right thing
-    * with regards to invalidating the framebuffers.
-    *
-    * For the GL gallium frontend that means that it needs to invalidate
-    * the framebuffer in glViewport itself.
-    */
-   ST_MANAGER_BROKEN_INVALIDATE
-};
-
 struct pipe_resource;
 struct util_queue_monitoring;
 
@@ -191,6 +177,7 @@ struct st_config_options
    bool force_compat_shaders;
    bool force_glsl_extensions_warn;
    unsigned force_glsl_version;
+   unsigned default_glsl_version;
    bool allow_extra_pp_tokens;
    bool allow_glsl_extension_directive_midshader;
    bool allow_glsl_120_subset_in_110;
@@ -210,6 +197,7 @@ struct st_config_options
    bool allow_draw_out_of_order;
    bool glthread_nop_check_framebuffer_status;
    bool ignore_map_unsynchronized;
+   bool ignore_map_invalidate_buffer;
    bool zero_invalidated_buffers;
    bool ignore_discard_framebuffer;
    bool force_integer_tex_nearest;
@@ -224,6 +212,7 @@ struct st_config_options
    char *mesa_extension_override;
    bool allow_multisampled_copyteximage;
    bool vertex_program_default_out;
+   unsigned limit_max_texture_size;
 
    unsigned char config_options_blake3[BLAKE3_KEY_LEN];
 };
@@ -337,10 +326,13 @@ struct pipe_frontend_screen
                               void *egl_image);
 
    /**
-    * Query a feature or property from the DRI/GLX/WGL frontend.
+    * The DRI frontend on old libGL's doesn't do the right thing
+    * with regards to invalidating the framebuffers.
+    *
+    * For the GL gallium frontend that means that it needs to invalidate
+    * the framebuffer in glViewport itself.
     */
-   int (*get_param)(struct pipe_frontend_screen *fscreen,
-                    enum st_manager_param param);
+   bool broken_invalidate;
 
    /**
     * Call the loader function setBackgroundContext. Called from the worker

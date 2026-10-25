@@ -57,8 +57,7 @@ vk_primitive_topology_to_mtl_primitive_type(enum VkPrimitiveTopology topology)
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
       return MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP;
    default:
-      assert(0 && "Primitive topology not supported!");
-      return 0;
+      UNREACHABLE("Primitive topology not supported!");
    }
 }
 
@@ -74,13 +73,14 @@ vk_primitive_topology_to_mtl_primitive_topology_class(
       return MTL_PRIMITIVE_TOPOLOGY_CLASS_LINE;
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wswitch"
    case VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA:
 #pragma GCC diagnostic pop
       return MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE;
    default:
-      return MTL_PRIMITIVE_TOPOLOGY_CLASS_UNSPECIFIED;
+      UNREACHABLE("Primitive topology not supported!");
    }
 }
 
@@ -248,6 +248,34 @@ vk_front_face_to_mtl_cull_mode(enum VkCullModeFlagBits mode)
       return MTL_CULL_MODE_BACK;
    default:
       UNREACHABLE("Unsupported VkCullModeFlags");
+   }
+}
+
+enum mtl_depth_resolve_filter
+vk_resolve_mode_to_mtl_depth_resolve_filter(
+   enum VkResolveModeFlagBits resolve_mode)
+{
+   switch (resolve_mode) {
+   case VK_RESOLVE_MODE_SAMPLE_ZERO_BIT:
+      return MTL_DEPTH_RESOLVE_FILTER_SAMPLE_0;
+   case VK_RESOLVE_MODE_MIN_BIT:
+      return MTL_DEPTH_RESOLVE_FILTER_MIN;
+   case VK_RESOLVE_MODE_MAX_BIT:
+      return MTL_DEPTH_RESOLVE_FILTER_MAX;
+   default:
+      UNREACHABLE("Unsupported VkResolveMode for depth");
+   }
+}
+
+enum mtl_stencil_resolve_filter
+vk_resolve_mode_to_mtl_stencil_resolve_filter(
+   enum VkResolveModeFlagBits resolve_mode)
+{
+   switch (resolve_mode) {
+   case VK_RESOLVE_MODE_SAMPLE_ZERO_BIT:
+      return MTL_STENCIL_RESOLVE_FILTER_SAMPLE_0;
+   default:
+      UNREACHABLE("Unsupported VkResolveMode for stencil");
    }
 }
 

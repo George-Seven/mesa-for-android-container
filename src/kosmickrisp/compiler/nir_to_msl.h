@@ -93,6 +93,8 @@ void msl_nir_lower_clip_cull_distance(nir_shader *nir,
 bool msl_nir_lower_instance_id(nir_shader *nir);
 bool msl_nir_lower_vs_disabled_depth_clamp_clip(nir_shader *nir);
 bool msl_nir_lower_fs_combined_depth_clamp_clip(nir_shader *nir);
+bool msl_nir_lower_multisample_alpha(nir_shader *s, bool alpha_to_coverage,
+                                     bool alpha_to_one);
 
 bool msl_gather_uses_per_draw_data(nir_shader *nir);
 
@@ -124,8 +126,6 @@ static const nir_shader_compiler_options kk_nir_options = {
    .lower_find_lsb = true,
    .has_uclz = true,
    .lower_mul_2x32_64 = true,
-   .lower_uadd_carry = true,
-   .lower_usub_borrow = true,
    .compact_arrays = true,
    /* Metal does not support double. */
    .lower_doubles_options = (nir_lower_doubles_options)(~0),

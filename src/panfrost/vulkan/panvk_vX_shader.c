@@ -26,6 +26,8 @@
 #include "util/mesa-blake3.h"
 #include "util/shader_stats.h"
 #include "util/u_dynarray.h"
+#include "util/u_hexdump.h"
+#include "util/u_memory.h"
 #include "nir_builder.h"
 #include "nir_conversion_builder.h"
 #include "nir_deref.h"
@@ -316,10 +318,6 @@ mark_all_access_non_uniform(nir_builder *b, nir_instr *instr, void *data)
             tex->sampler_non_uniform = true;
             break;
 
-         case nir_tex_src_offset:
-            tex->offset_non_uniform = true;
-            break;
-
          default:
             break;
          }
@@ -437,6 +435,17 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
 {
    struct panvk_physical_device *pdev = to_panvk_physical_device(vk_pdev);
 
+   /* Lower mediump temporary vars before NIR has the chance to screw it up
+    * and delete the mediump information.  On the old back-end, this might be
+    * a performance regression because of all the extra f2f it may insert but
+    * Kraid is good enough at fusing float conversions into other ALU ops that
+    * it doesn't really matter.
+    */
+   if (pan_use_kraid(PAN_ARCH, nir->info.stage, nir->info.internal)) {
+      NIR_PASS(_, nir, nir_lower_mediump_vars,
+               nir_var_shader_temp | nir_var_function_temp);
+   }
+
    /* Ensure to regroup output variables at the same location */
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_opt_vectorize_io_vars, nir_var_shader_out);
@@ -501,7 +510,7 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
    NIR_PASS(_, nir, nir_inline_sysval, nir_intrinsic_load_core_max_id_arm,
             core_max_id);
 
-   pan_preprocess_nir(nir, pdev->kmod.dev->props.gpu_id);
+   pan_preprocess_nir(nir, PAN_ARCH);
 }
 
 static void
@@ -835,6 +844,8 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
 {
    mesa_shader_stage stage = nir->info.stage;
 
+   NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
+
    /* Run before descriptor and explicit-IO lowering so the memory derefs this
     * pass emits get lowered by them.
     */
@@ -1048,6 +1059,17 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
    }
    util_dynarray_fini(&binary);
 
+#if PAN_ARCH < 9
+   if (nir->constant_data_size) {
+      shader->data_ptr = mem_dup(nir->constant_data, nir->constant_data_size);
+
+      if (shader->data_ptr == NULL)
+         return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+      shader->data_size = nir->constant_data_size;
+   }
+#endif
+
    if (dump_asm) {
       shader->nir_str = nir_shader_as_str(nir, NULL);
 
@@ -1058,8 +1080,15 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
          struct u_memstream mem;
          if (u_memstream_open(&mem, &data, &disasm_size)) {
             FILE *const stream = u_memstream_get(&mem);
+            struct panvk_physical_device *phys_dev =
+               to_panvk_physical_device(dev->vk.physical);
             pan_disassemble(stream, shader->bin_ptr, shader->bin_size,
-                            compile_input->gpu_id, false);
+                            phys_dev->kmod.dev->props.gpu_id, false);
+            if (nir->constant_data_size) {
+               fprintf(stream, "constant data (%u bytes):\n",
+                       nir->constant_data_size);
+               u_hexdump_words(stream, nir->constant_data, nir->constant_data_size);
+            }
             u_memstream_close(&mem);
          }
       }
@@ -1162,6 +1191,7 @@ panvk_shader_upload(struct panvk_device *dev,
    shader->code_mem = (struct panvk_priv_mem){0};
 
 #if PAN_ARCH < 9
+   shader->data_mem = (struct panvk_priv_mem){0};
    shader->rsd = (struct panvk_priv_mem){0};
 #else
    shader->spd = (struct panvk_priv_mem){0};
@@ -1175,7 +1205,20 @@ panvk_shader_upload(struct panvk_device *dev,
    if (!panvk_priv_mem_check_alloc(shader->code_mem))
       return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
+#if PAN_ARCH >= 9
+   /* The inline constant pool is addressed as PC plus a 32-bit offset */
+   ASSERTED uint64_t code_dev_addr = panvk_priv_mem_dev_addr(shader->code_mem);
+   assert(code_dev_addr >> 32 == (code_dev_addr + shader->bin_size - 1) >> 32);
+#endif
+
 #if PAN_ARCH < 9
+   if (shader->data_size) {
+      shader->data_mem = panvk_pool_upload_aligned(
+         &dev->mempools.rw, shader->data_ptr, shader->data_size, 64);
+      if (!panvk_priv_mem_check_alloc(shader->data_mem))
+         return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
    if (shader->info.stage == MESA_SHADER_FRAGMENT)
       return VK_SUCCESS;
 
@@ -1312,6 +1355,7 @@ panvk_shader_variant_destroy(struct panvk_shader_variant *shader)
    panvk_pool_free_mem(&shader->code_mem);
 
 #if PAN_ARCH < 9
+   panvk_pool_free_mem(&shader->data_mem);
    panvk_pool_free_mem(&shader->rsd);
 #else
    if (shader->info.stage != MESA_SHADER_VERTEX) {
@@ -1326,6 +1370,10 @@ panvk_shader_variant_destroy(struct panvk_shader_variant *shader)
       panvk_pool_free_mem(&shader->spds.pos_triangles);
 #endif
    }
+#endif
+
+#if PAN_ARCH < 9
+   free((void *)shader->data_ptr);
 #endif
 
    if (shader->own_bin)
@@ -1382,8 +1430,8 @@ panvk_compile_shader(struct panvk_device *dev,
       robust_modes |= nir_var_mem_ssbo;
 
    struct pan_compile_inputs inputs = {
-      .gpu_id = phys_dev->kmod.dev->props.gpu_id,
-      .gpu_variant = phys_dev->kmod.dev->props.gpu_variant,
+      .arch = PAN_ARCH,
+      .model = phys_dev->model,
       .view_mask = (state && state->rp) ? state->mv->view_mask : 0,
       .robust_modes = robust_modes,
       .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
@@ -1447,9 +1495,8 @@ panvk_compile_shader(struct panvk_device *dev,
 
          struct pan_varying_layout varying_layout;
          if (v == PANVK_VS_VARIANT_HW) {
-            pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id);
-            pan_build_varying_layout_compact(&varying_layout, nir,
-                                             inputs.gpu_id);
+            pan_varying_collect_formats(&varying_layout, nir, PAN_ARCH);
+            pan_build_varying_layout_compact(&varying_layout, nir, PAN_ARCH);
             inputs.varying_layout = &varying_layout;
          }
 
@@ -1540,15 +1587,16 @@ panvk_compile_shader(struct panvk_device *dev,
 
       nir_shader *nir = info->nir;
 
+      bool allow_merging_workgroups = false;
 #if PAN_ARCH >= 9
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-      variant->info.cs.allow_merging_workgroups =
+      allow_merging_workgroups =
          valhall_can_merge_workgroups(nir);
 
       /* With merged workgroups, we need to use different divergence analysis
        * options to take into account that threads from different workgroups
        * may be in the same subgroup */
-      if (variant->info.cs.allow_merging_workgroups) {
+      if (allow_merging_workgroups) {
          nir->options = pan_get_nir_shader_compiler_options(
             PAN_ARCH, MESA_SHADER_COMPUTE, true);
          /* Invalidate the old divergence analysis */
@@ -1559,7 +1607,7 @@ panvk_compile_shader(struct panvk_device *dev,
 
       panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
                       info->robustness, state, &shader->desc_info,
-                      variant->info.cs.allow_merging_workgroups);
+                      allow_merging_workgroups);
 
       variant->own_bin = true;
 
@@ -1570,6 +1618,7 @@ panvk_compile_shader(struct panvk_device *dev,
          panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
          return result;
       }
+      variant->info.cs.allow_merging_workgroups = allow_merging_workgroups;
       break;
    }
 
@@ -1756,10 +1805,16 @@ shader_desc_info_deserialize(struct panvk_device *dev,
 
 #if PAN_ARCH < 9
    shader->desc_info.dyn_ubos.count = blob_read_uint32(blob);
+   if (shader->desc_info.dyn_ubos.count >
+       ARRAY_SIZE(shader->desc_info.dyn_ubos.map))
+      return panvk_error(shader, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    blob_copy_bytes(blob, shader->desc_info.dyn_ubos.map,
                    sizeof(*shader->desc_info.dyn_ubos.map) *
                       shader->desc_info.dyn_ubos.count);
    shader->desc_info.dyn_ssbos.count = blob_read_uint32(blob);
+   if (shader->desc_info.dyn_ssbos.count >
+       ARRAY_SIZE(shader->desc_info.dyn_ssbos.map))
+      return panvk_error(shader, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    blob_copy_bytes(blob, shader->desc_info.dyn_ssbos.map,
                    sizeof(*shader->desc_info.dyn_ssbos.map) *
                       shader->desc_info.dyn_ssbos.count);
@@ -1767,6 +1822,8 @@ shader_desc_info_deserialize(struct panvk_device *dev,
    uint32_t others_count = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(shader->desc_info.others.count); i++) {
       shader->desc_info.others.count[i] = blob_read_uint32(blob);
+      if (shader->desc_info.others.count[i] > UINT32_MAX - others_count)
+         return panvk_error(shader, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       others_count += shader->desc_info.others.count[i];
    }
 
@@ -1787,6 +1844,9 @@ shader_desc_info_deserialize(struct panvk_device *dev,
    }
 #else
    shader->desc_info.dyn_bufs.count = blob_read_uint32(blob);
+   if (shader->desc_info.dyn_bufs.count >
+       ARRAY_SIZE(shader->desc_info.dyn_bufs.map))
+      return panvk_error(shader, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
    blob_copy_bytes(blob, shader->desc_info.dyn_bufs.map,
                    sizeof(*shader->desc_info.dyn_bufs.map) *
                       shader->desc_info.dyn_bufs.count);
@@ -1847,6 +1907,19 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
 
    shader->own_bin = true;
    blob_copy_bytes(blob, (void *)shader->bin_ptr, shader->bin_size);
+
+#if PAN_ARCH < 9
+   shader->data_size = blob_read_uint32(blob);
+
+   if (shader->data_size) {
+      shader->data_ptr = malloc(shader->data_size);
+
+      if (shader->data_ptr == NULL)
+         return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+      blob_copy_bytes(blob, (void *)shader->data_ptr, shader->data_size);
+   }
+#endif
 
    uint32_t nir_str_size = blob_read_uint32(blob);
    uint32_t asm_str_size = blob_read_uint32(blob);
@@ -1986,6 +2059,11 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
 
    blob_write_uint32(blob, shader->bin_size);
    blob_write_bytes(blob, shader->bin_ptr, shader->bin_size);
+
+#if PAN_ARCH < 9
+   blob_write_uint32(blob, shader->data_size);
+   blob_write_bytes(blob, shader->data_ptr, shader->data_size);
+#endif
 
    /* Include the terminating NULL in the serialization */
    uint32_t nir_str_size = shader->nir_str ? strlen(shader->nir_str) + 1 : 0;

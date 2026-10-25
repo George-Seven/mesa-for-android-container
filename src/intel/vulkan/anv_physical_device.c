@@ -20,6 +20,7 @@
 #include "git_sha1.h"
 
 #include "util/disk_cache.h"
+#include "util/hex.h"
 #include "util/os_misc.h"
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
@@ -95,6 +96,7 @@ anv_physical_device_init_drirc(struct anv_physical_device *device)
    anv_parse_dri_options(&device->drirc,
                          &(driConfigFileParseParams) {
                             .driverName = "anv",
+                            .deviceVersion = device->info.verx10,
                             .applicationName = instance->vk.app_info.app_name,
                             .applicationVersion = instance->vk.app_info.app_version,
                             .engineName = instance->vk.app_info.engine_name,
@@ -164,6 +166,33 @@ anv_physical_device_init_drirc(struct anv_physical_device *device)
       mesa_logw("Invalid value provided for drirc anv_rt_dispatch_timeout=%u, reverting to 512.",
                 device->drirc.perf.rt_dispatch_timeout);
       device->drirc.perf.rt_dispatch_timeout = 512;
+      break;
+   }
+
+   if (device->drirc.perf.rt_tile_x != 0 &&
+       !util_is_power_of_two_nonzero(device->drirc.perf.rt_tile_x)) {
+      mesa_logw("Invalid value provided for drirc anv_rt_tile_x=%u, reverting to 0.",
+                device->drirc.perf.rt_tile_x);
+      device->drirc.perf.rt_tile_x = 0;
+   }
+
+   if (device->drirc.perf.rt_tile_y != 0 &&
+       !util_is_power_of_two_nonzero(device->drirc.perf.rt_tile_y)) {
+      mesa_logw("Invalid value provided for drirc anv_rt_tile_y=%u, reverting to 0.",
+                device->drirc.perf.rt_tile_y);
+      device->drirc.perf.rt_tile_y = 0;
+   }
+
+   switch (device->drirc.perf.code_motion) {
+   case INTEL_CODE_MOTION_DEFAULT:
+   case INTEL_CODE_MOTION_LICM:
+   case INTEL_CODE_MOTION_GCM:
+      break;
+   default:
+      mesa_logw("Invalid value provided for drirc intel_code_motion=%d, "
+                "reverting to the compiler default.",
+                device->drirc.perf.code_motion);
+      device->drirc.perf.code_motion = INTEL_CODE_MOTION_DEFAULT;
       break;
    }
 
@@ -309,7 +338,7 @@ get_device_descriptor_limits(const struct anv_physical_device *device,
       ANV_SURFACE_STATE_SIZE;
    const uint32_t sampler_descriptor_size =
       device->indirect_descriptors ?
-      sizeof(struct anv_sampled_image_descriptor) :
+      sizeof(struct anv_image_descriptor) :
       ANV_SAMPLER_STATE_SIZE;
 
    limits->max_ubos = descriptor_heap_size / buffer_descriptor_size;
@@ -336,6 +365,9 @@ get_device_extensions(const struct anv_physical_device *device,
                                      ANV_DEBUG(VIDEO_ENCODE);
    const bool video_decode_enabled = ANV_DEBUG(VIDEO_DECODE);
 
+   if (VIDEO_CODEC_H265DEC && video_decode_enabled && !device->has_huc)
+      debug_warn_once("HuC firmware is not loaded, disabling H.265 video decoding");
+
    *ext = (struct vk_device_extension_table) {
       .KHR_8bit_storage                      = true,
       .KHR_16bit_storage                     = !device->drirc.debug.no_16bit,
@@ -361,6 +393,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_driver_properties                 = true,
       .KHR_dynamic_rendering                 = true,
       .KHR_dynamic_rendering_local_read      = true,
+      .KHR_extended_flags                    = true,
       .KHR_external_fence                    = true,
       .KHR_external_fence_fd                 = true,
       .KHR_external_memory                   = true,
@@ -397,6 +430,14 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_multiview                         = true,
       .KHR_performance_query =
          device->perf &&
+         /* The KHR profiling lock's OA stream and a metrics-library
+          * configuration activation (VK_INTEL_performance_query, advertised
+          * below when INTEL_USE_METRICS_LIBRARY is set) reprogram the same OA
+          * unit, so the two paths would silently corrupt each other's
+          * counters. The metrics library is an explicit per-process opt-in,
+          * so advertise only one of the two.
+          */
+         !device->perf->use_metrics_library &&
          (intel_perf_has_hold_preemption(device->perf) ||
           INTEL_DEBUG(DEBUG_NO_OACONFIG)) &&
          !ANV_DEBUG(NO_SECONDARY_CALL),
@@ -453,7 +494,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_video_queue                       = video_decode_enabled || video_encode_enabled,
       .KHR_video_decode_queue                = video_decode_enabled,
       .KHR_video_decode_h264                 = VIDEO_CODEC_H264DEC && video_decode_enabled,
-      .KHR_video_decode_h265                 = VIDEO_CODEC_H265DEC && video_decode_enabled,
+      .KHR_video_decode_h265                 = VIDEO_CODEC_H265DEC && video_decode_enabled && device->has_huc,
       .KHR_video_decode_av1                  = device->info.ver >= 12 && VIDEO_CODEC_AV1DEC && video_decode_enabled,
       .KHR_video_decode_vp9                  = VIDEO_CODEC_VP9DEC && video_decode_enabled,
       .KHR_video_encode_queue                = video_encode_enabled,
@@ -607,6 +648,7 @@ get_device_extensions(const struct anv_physical_device *device,
 #endif
       .GOOGLE_hlsl_functionality1            = true,
       .GOOGLE_user_type                      = true,
+      .INTEL_device_info                     = true,
       .INTEL_performance_query               = device->perf && device->perf->use_metrics_library,
       .INTEL_shader_integer_functions2       = true,
       .MESA_image_alignment_control          = true,
@@ -723,10 +765,10 @@ get_features(const struct anv_physical_device *pdevice,
       .shaderBufferInt64Atomics            = true,
       .shaderSharedInt64Atomics            = false,
       .shaderFloat16                       = !pdevice->drirc.debug.no_16bit,
-      .shaderInt8                          = !pdevice->drirc.debug.no_16bit,
+      .shaderInt8                          = true,
 
       .descriptorIndexing                                 = true,
-      .shaderInputAttachmentArrayDynamicIndexing          = false,
+      .shaderInputAttachmentArrayDynamicIndexing          = true,
       .shaderUniformTexelBufferArrayDynamicIndexing       = true,
       .shaderStorageTexelBufferArrayDynamicIndexing       = true,
       .shaderUniformBufferArrayNonUniformIndexing         = true,
@@ -948,8 +990,8 @@ get_features(const struct anv_physical_device *pdevice,
       .shaderSharedFloat64AtomicAdd =  false,
       .shaderImageFloat32Atomics =     true,
       .shaderImageFloat32AtomicAdd =   pdevice->info.ver >= 20,
-      .sparseImageFloat32Atomics =     false,
-      .sparseImageFloat32AtomicAdd =   false,
+      .sparseImageFloat32Atomics =     has_sparse_or_fake,
+      .sparseImageFloat32AtomicAdd =   has_sparse_or_fake && pdevice->info.ver >= 20,
 
       /* VK_EXT_shader_atomic_float2 */
       .shaderBufferFloat16Atomics      = pdevice->info.has_lsc,
@@ -964,8 +1006,8 @@ get_features(const struct anv_physical_device *pdevice,
       .shaderSharedFloat16AtomicMinMax = pdevice->info.has_lsc,
       .shaderSharedFloat32AtomicMinMax = true,
       .shaderSharedFloat64AtomicMinMax = false,
-      .shaderImageFloat32AtomicMinMax  = false,
-      .sparseImageFloat32AtomicMinMax  = false,
+      .shaderImageFloat32AtomicMinMax  = pdevice->info.ver >= 20,
+      .sparseImageFloat32AtomicMinMax  = has_sparse_or_fake && pdevice->info.ver >= 20,
 
       /* VK_KHR_shader_clock */
       .shaderSubgroupClock = true,
@@ -1102,7 +1144,7 @@ get_features(const struct anv_physical_device *pdevice,
       .cooperativeMatrix = pdevice->has_cooperative_matrix,
 
       /* VK_NV_cooperative_matrix2 */
-      .cooperativeMatrixPerElementOperations = pdevice->has_cooperative_matrix,
+      .cooperativeMatrixPerElementOperationsNV = pdevice->has_cooperative_matrix,
 
       /* VK_KHR_shader_maximal_reconvergence */
       .shaderMaximalReconvergence = true,
@@ -1276,6 +1318,9 @@ get_features(const struct anv_physical_device *pdevice,
       /* soft fp64 does not support fma */
       .shaderFmaFloat64 = pdevice->info.has_64bit_float &&
                           !INTEL_DEBUG(DEBUG_SOFT64),
+
+      /* VK_KHR_extended_flags */
+      .extendedFlags = true,
    };
 
    /* The new DOOM and Wolfenstein games require depthBounds without
@@ -1292,19 +1337,6 @@ get_features(const struct anv_physical_device *pdevice,
 #define MAX_PER_STAGE_DESCRIPTOR_UNIFORM_BUFFERS   64
 
 #define MAX_PER_STAGE_DESCRIPTOR_INPUT_ATTACHMENTS 64
-
-static VkDeviceSize
-anx_get_physical_device_max_heap_size(const struct anv_physical_device *pdevice)
-{
-   VkDeviceSize ret = 0;
-
-   for (uint32_t i = 0; i < pdevice->memory.heap_count; i++) {
-      if (pdevice->memory.heaps[i].size > ret)
-         ret = pdevice->memory.heaps[i].size;
-   }
-
-   return ret;
-}
 
 static void
 get_properties_1_1(const struct anv_physical_device *pdevice,
@@ -1556,8 +1588,6 @@ get_properties(const struct anv_physical_device *pdevice,
    if (!os_get_page_size(&page_size))
       page_size = 4096;         /* fallback */
 
-   const VkDeviceSize max_heap_size = anx_get_physical_device_max_heap_size(pdevice);
-
    const uint32_t max_workgroup_size =
       MIN2(1024, 32 * devinfo->max_cs_workgroup_threads);
 
@@ -1593,8 +1623,10 @@ get_properties(const struct anv_physical_device *pdevice,
       .maxImageArrayLayers                      = (1 << 11),
       .maxTexelBufferElements                   = 128 * 1024 * 1024,
 
-      .maxUniformBufferRange                    = intel_indirect_ubos_use_sampler(devinfo) ? (1u << 27) : (1u << 30),
-      .maxStorageBufferRange                    = MIN3(pdevice->isl_dev.max_buffer_size, max_heap_size, UINT32_MAX),
+      .maxUniformBufferRange                    = MIN2(intel_indirect_ubos_use_sampler(devinfo) ?
+                                                       (1u << 27) : pdevice->isl_dev.max_buffer_size,
+                                                       UINT32_MAX),
+      .maxStorageBufferRange                    = MIN2(pdevice->isl_dev.max_buffer_size, UINT32_MAX),
       .maxPushConstantsSize                     = MAX_PUSH_CONSTANTS_SIZE,
       .maxMemoryAllocationCount                 = UINT32_MAX,
       .maxSamplerAllocationCount                = 64 * 1024,
@@ -1736,7 +1768,7 @@ get_properties(const struct anv_physical_device *pdevice,
             "%s", (strlen(pdevice->drirc.debug.force_vk_devicename) > 0) ?
                   pdevice->drirc.debug.force_vk_devicename : pdevice->info.name);
    memcpy(props->pipelineCacheUUID,
-          pdevice->pipeline_cache_uuid, VK_UUID_SIZE);
+          pdevice->shader_binary_uuid, VK_UUID_SIZE);
 
    get_properties_1_1(pdevice, props);
    get_properties_1_2(pdevice, props);
@@ -1997,21 +2029,36 @@ get_properties(const struct anv_physical_device *pdevice,
       props->robustStorageBufferDescriptorSize = ANV_SURFACE_STATE_SIZE;
       props->inputAttachmentDescriptorSize = ANV_SURFACE_STATE_SIZE;
       props->accelerationStructureDescriptorSize = sizeof(struct anv_address_range_descriptor);
-      props->maxSamplerDescriptorBufferRange = anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size;
-      props->maxResourceDescriptorBufferRange = anv_physical_device_bindless_heap_size(pdevice,
-                                                                                       true);
-      props->resourceDescriptorBufferAddressSpaceSize = anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size;
-      props->descriptorBufferAddressSpaceSize = anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size;
-      props->samplerDescriptorBufferAddressSpaceSize = anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size;
+
+      if (pdevice->uses_efficient_64bit) {
+         props->maxSamplerDescriptorBufferRange = pdevice->va.bindless_surface_state_pool.size;
+         props->maxResourceDescriptorBufferRange = pdevice->va.bindless_surface_state_pool.size;
+         props->resourceDescriptorBufferAddressSpaceSize = pdevice->va.bindless_surface_state_pool.size;
+         props->descriptorBufferAddressSpaceSize = pdevice->va.bindless_surface_state_pool.size;
+         props->samplerDescriptorBufferAddressSpaceSize = pdevice->va.bindless_surface_state_pool.size;
+      } else {
+         props->maxSamplerDescriptorBufferRange =
+            anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size;
+         props->maxResourceDescriptorBufferRange =
+            anv_physical_device_bindless_heap_size(pdevice, true);
+         props->resourceDescriptorBufferAddressSpaceSize =
+            anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size;
+         props->descriptorBufferAddressSpaceSize =
+            anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size;
+         props->samplerDescriptorBufferAddressSpaceSize =
+            anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size;
+      }
    }
 
    /* VK_EXT_descriptor_heap */
    {
       props->samplerHeapAlignment = 64;
       props->resourceHeapAlignment = 64;
-      props->maxSamplerHeapSize = pdevice->va.dynamic_visible_pool.size;
-      props->maxResourceHeapSize = anv_physical_device_bindless_heap_size(pdevice,
-                                                                          true);
+      props->maxSamplerHeapSize = pdevice->uses_efficient_64bit ?
+         anv_physical_device_bindless_heap_size(pdevice, true) :
+         pdevice->va.dynamic_visible_pool.size;
+      props->maxResourceHeapSize =
+         anv_physical_device_bindless_heap_size(pdevice, true);
       props->minSamplerHeapReservedRange = 0;
       props->minSamplerHeapReservedRangeWithEmbedded = 0;
       props->minResourceHeapReservedRange = 0;
@@ -2022,7 +2069,7 @@ get_properties(const struct anv_physical_device *pdevice,
       props->imageDescriptorAlignment = ANV_SURFACE_STATE_SIZE;
       props->bufferDescriptorAlignment = ANV_SURFACE_STATE_SIZE;
       props->maxPushDataSize = MAX_PUSH_CONSTANTS_SIZE;
-      props->imageCaptureReplayOpaqueDataSize = 8;
+      props->imageCaptureReplayOpaqueDataSize = sizeof(struct anv_image_opaque_capture_data);
       props->maxDescriptorHeapEmbeddedSamplers = MAX_EMBEDDED_SAMPLERS;
       props->samplerYcbcrConversionCount = 3;
       props->sparseDescriptorHeaps = pdevice->info.kmd_type == INTEL_KMD_TYPE_XE;
@@ -2445,6 +2492,13 @@ get_properties(const struct anv_physical_device *pdevice,
    {
       props->maxDeviceFaultCount = UINT32_MAX;
    }
+
+   /* VK_INTEL_device_info */
+   {
+      props->deviceIpVersionArch = devinfo->gfx_ip_ver >> 16;
+      props->deviceIpVersionRelease = devinfo->gfx_ip_ver & 0xffff;
+      props->deviceIpVersionRevision = devinfo->revision;
+   }
 }
 
 /* This function restricts the maximum size of system memory heap. The
@@ -2698,36 +2752,19 @@ anv_physical_device_init_heaps(struct anv_physical_device *device, int fd)
 static VkResult
 anv_physical_device_init_uuids(struct anv_physical_device *device)
 {
-   const struct build_id_note *note =
-      build_id_find_nhdr_for_addr(anv_physical_device_init_uuids);
-   if (!note) {
+   blake3_hasher build_id_ctx;
+   _mesa_blake3_init(&build_id_ctx);
+   if (!disk_cache_get_function_identifier(anv_physical_device_init_uuids,
+                                           &build_id_ctx)) {
       return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
                        "Failed to find build-id");
    }
+   _mesa_blake3_final(&build_id_ctx, device->driver_build_sha1);
 
-   unsigned build_id_len = build_id_length(note);
-   if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
-      return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
-                       "build-id too short.  It needs to be a SHA");
-   }
-
-   copy_build_id_to_sha1(device->driver_build_sha1, note);
-
-   blake3_hasher blake3_ctx;
-   uint8_t blake3[BLAKE3_KEY_LEN];
-   STATIC_ASSERT(VK_UUID_SIZE <= sizeof(blake3));
-
-   /* The pipeline cache UUID is used for determining when a pipeline cache is
-    * invalid.  It needs both a driver build and the PCI ID of the device.
+   /* Fills device->shader_binary_uuid, which the pipeline cache UUID and the
+    * disk cache id below are also taken from.
     */
-   _mesa_blake3_init(&blake3_ctx);
-   _mesa_blake3_update(&blake3_ctx, build_id_data(note), build_id_len);
-   brw_device_blake3_update(&blake3_ctx, &device->info);
-   bool always_use_bindless = ANV_DEBUG(BINDLESS);
-   _mesa_blake3_update(&blake3_ctx, &always_use_bindless,
-                     sizeof(always_use_bindless));
-   _mesa_blake3_final(&blake3_ctx, blake3);
-   memcpy(device->pipeline_cache_uuid, blake3, VK_UUID_SIZE);
+   anv_shader_init_uuid(device);
 
    intel_uuid_compute_driver_id(device->driver_uuid, &device->info, VK_UUID_SIZE);
    intel_uuid_compute_device_id(device->device_uuid, &device->info, VK_UUID_SIZE);
@@ -2744,12 +2781,16 @@ anv_physical_device_init_disk_cache(struct anv_physical_device *device)
                                device->info.pci_device_id);
    assert(len == sizeof(renderer) - 2);
 
-   char timestamp[BLAKE3_HEX_LEN];
-   _mesa_blake3_format(timestamp, device->driver_build_sha1);
+   /* The driver id namespaces everything the runtime puts in the disk cache,
+    * including the NIR of vk_pipeline_precompile_shader(), which is keyed on
+    * API state alone. So it needs the compile options, not just the build.
+    */
+   char driver_id[VK_UUID_SIZE * 2 + 1];
+   mesa_bytes_to_hex(driver_id, device->shader_binary_uuid, VK_UUID_SIZE);
 
    const uint64_t driver_flags =
       brw_get_compiler_config_value(device->compiler);
-   device->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+   device->vk.disk_cache = disk_cache_create(renderer, driver_id, driver_flags);
 #endif
 }
 
@@ -2767,14 +2808,16 @@ anv_physical_device_free_disk_cache(struct anv_physical_device *device)
 }
 
 static void
-anv_override_engine_counts(int *gc_count, int *g_count, int *c_count, int *v_count, int *blit_count)
+anv_override_engine_counts(struct anv_physical_device *device,
+                           int *gc_count, int *g_count, int *c_count,
+                           int *v_count, int *blit_count)
 {
    int gc_override = -1;
    int g_override = -1;
    int c_override = -1;
    int v_override = -1;
    int blit_override = -1;
-   const char *env_ = os_get_option("ANV_QUEUE_OVERRIDE");
+   const char *env_ = device->drirc.perf.queue_override;
 
    /* Override queues for Android HWUI that expects min 2 queues. */
 #if DETECT_OS_ANDROID
@@ -2799,7 +2842,7 @@ anv_override_engine_counts(int *gc_count, int *g_count, int *c_count, int *v_cou
       } else if (strncmp(next, "b=", 2) == 0) {
          blit_override = strtol(next + 2, NULL, 0);
       } else {
-         mesa_logw("Ignoring unsupported ANV_QUEUE_OVERRIDE token: %s", next);
+         mesa_logw("Ignoring unsupported anv_queue_override token: %s", next);
       }
       next = strtok_r(NULL, ",", &save);
    }
@@ -2809,7 +2852,7 @@ anv_override_engine_counts(int *gc_count, int *g_count, int *c_count, int *v_cou
    if (g_override >= 0)
       *g_count = g_override;
    if (*g_count > 0 && *gc_count <= 0 && (gc_override >= 0 || g_override >= 0))
-      mesa_logw("ANV_QUEUE_OVERRIDE: gc=0 with g > 0 violates the "
+      mesa_logw("anv_queue_override: gc=0 with g > 0 violates the "
                 "Vulkan specification");
    if (c_override >= 0)
       *c_count = c_override;
@@ -2860,7 +2903,7 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
          blit_count = pdevice->info.engine_class_supported_count[INTEL_ENGINE_CLASS_COPY];
       }
 
-      anv_override_engine_counts(&gc_count, &g_count, &c_count, &v_count, &blit_count);
+      anv_override_engine_counts(pdevice, &gc_count, &g_count, &c_count, &v_count, &blit_count);
 
       enum intel_engine_class compute_class =
          pdevice->info.engine_class_supported_count[INTEL_ENGINE_CLASS_COMPUTE] &&
@@ -2926,7 +2969,8 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
       if (blit_count > 0) {
          pdevice->queue.families[family_count++] = (struct anv_queue_family) {
             .queueFlags = VK_QUEUE_TRANSFER_BIT |
-                          protected_flag,
+                          protected_flag |
+                          sparse_flags,
             .queueCount = blit_count,
             .engine_class = INTEL_ENGINE_CLASS_COPY,
          };
@@ -3089,6 +3133,8 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    device->has_protected_contexts = device->info.ver >= 12 &&
       intel_gem_supports_protected_context(fd, device->info.kmd_type);
 
+   device->has_huc = intel_gem_supports_huc(fd, device->info.kmd_type);
+
    /* Just pick one; they're all the same */
    device->has_astc_ldr =
       isl_format_supports_sampling(&device->info,
@@ -3100,7 +3146,7 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
          device->has_astc_ldr && !device->emu_astc_ldr;
    }
    device->brw_disable_subgroup_size_control =
-      !intel_use_jay(&device->info, MESA_SHADER_COMPUTE) &&
+      !intel_use_jay_for_stage(&devinfo, MESA_SHADER_COMPUTE) &&
       device->drirc.debug.disable_subgroup_size_control;
 
    result = anv_physical_device_init_heaps(device, fd);
@@ -3171,6 +3217,10 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
       !intel_has_extended_bindless(&devinfo) ||
       device->drirc.debug.force_indirect_descriptors;
 
+   device->uses_efficient_64bit =
+      device->info.verx10 >= 350 &&
+      device->drirc.debug.enable_efficient_64bit;
+
    device->alloc_aux_tt_mem =
       device->info.has_aux_map && device->info.verx10 >= 125;
 
@@ -3199,6 +3249,8 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
 
    device->can_get_vm_faults =
       !device->has_scratch_page && xe_gem_supports_get_vm_faults(device->local_fd);
+
+   device->info.no_jay = device->drirc.perf.disable_jay;
 
    device->compiler = brw_compiler_create(NULL, &device->info);
    if (device->compiler == NULL) {
@@ -3245,8 +3297,6 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    anv_physical_device_init_queue_families(device);
 
    anv_physical_device_init_perf(device, fd);
-
-   anv_shader_init_uuid(device);
 
    /* Gather major/minor before WSI. */
    struct stat st;

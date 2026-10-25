@@ -7,6 +7,7 @@
 #ifndef ACO_IR_H
 #define ACO_IR_H
 
+#include "aco_interface.h"
 #include "aco_opcodes.h"
 #include "aco_shader_info.h"
 #include "aco_util.h"
@@ -1790,15 +1791,15 @@ static_assert(sizeof(MUBUF_instruction) == sizeof(Instruction) + 8, "Unexpected 
 struct MTBUF_instruction : public Instruction {
    memory_sync_info sync;
    ac_hw_cache_flags cache;
-   uint8_t dfmt : 4;         /* Data Format of data in memory buffer */
-   uint8_t nfmt : 3;         /* Numeric format of data in memory */
-   bool offen : 1;           /* Supply an offset from VGPR (VADDR) */
-   bool idxen : 1;           /* Supply an index from VGPR (VADDR) */
-   bool tfe : 1;             /* texture fail enable */
-   bool disable_wqm : 1;     /* Require an exec mask without helper invocations */
+   uint8_t dfmt : 4;     /* Data Format of data in memory buffer */
+   uint8_t nfmt : 3;     /* Numeric format of data in memory */
+   bool offen : 1;       /* Supply an offset from VGPR (VADDR) */
+   bool idxen : 1;       /* Supply an index from VGPR (VADDR) */
+   bool tfe : 1;         /* texture fail enable */
+   bool disable_wqm : 1; /* Require an exec mask without helper invocations */
    uint8_t padding0 : 5;
    uint16_t padding1;
-   uint32_t offset : 23;     /* Unsigned byte offset */
+   uint32_t offset : 23; /* Unsigned byte offset */
    uint32_t padding2 : 9;
 };
 static_assert(sizeof(MTBUF_instruction) == sizeof(Instruction) + 12, "Unexpected padding");
@@ -2337,8 +2338,8 @@ public:
    unsigned wave_size;
    RegClass lane_mask;
    Stage stage;
-   bool needs_exact = false; /* there exists an instruction with disable_wqm = true */
-   bool needs_wqm = false;   /* there exists a p_wqm instruction */
+   bool needs_exact = false;             /* there exists an instruction with disable_wqm = true */
+   bool needs_wqm = false;               /* there exists a p_wqm instruction */
    bool needs_fp_mode_insertion = false; /* insert_fp_mode should be run */
    bool has_smem_buffer_or_global_loads = false;
    bool has_pops_overlapped_waves_wait = false;
@@ -2501,8 +2502,9 @@ void insert_delay_alu(Program* program);
 void combine_delay_alu(Program* program);
 void insert_NOPs(Program* program);
 void form_hard_clauses(Program* program);
-unsigned emit_program(Program* program, std::vector<uint32_t>& code,
-                      std::vector<struct aco_symbol>* symbols = NULL, bool append_endpgm = true);
+void emit_program(Program* program, std::vector<uint32_t>& code,
+                  std::vector<struct aco_symbol>& symbols, bool append_endpgm,
+                  aco_callback_params* params);
 /**
  * Returns true if print_asm can disassemble the given program for the current build/runtime
  * configuration
@@ -2544,7 +2546,7 @@ void aco_print_program(const Program* program, FILE* output, unsigned flags = 0)
 
 void _aco_err(Program* program, const char* file, unsigned line, const char* fmt, ...);
 
-#define aco_err(program, ...)      _aco_err(program, __FILE__, __LINE__, __VA_ARGS__)
+#define aco_err(program, ...) _aco_err(program, __FILE__, __LINE__, __VA_ARGS__)
 
 /* Returns the indices of operands to which definitions are tied to. */
 aco::small_vec<uint32_t, 2> get_tied_defs(Instruction* instr);

@@ -607,6 +607,11 @@ typedef struct {
    /* Valhall-only property to relax waits on read-only resources */
    bool wait_resource;
 
+   /* Valhall-only: at pack time, replace the immediate with the byte offset
+    * from the next instruction to the inline constant pool.
+    */
+   bool patch_imm_const_offset;
+
    /* Slot associated with a message-passing instruction */
    uint8_t slot;
 
@@ -617,6 +622,13 @@ typedef struct {
    /* Tags the gl_PointSize memory write, this is used if we want to
     * create a variant without psiz writes */
    bool is_psiz_write;
+
+   /* Tags the two instructions va_lower_blend() appends after BLEND to call
+    * a blend shader. Under fixed-function blending, they are always skipped,
+    * so they are a fixed ABI cost rather than shader work and are excluded
+    * from statistics.
+    */
+   bool is_blend_prologue;
 
    /* On Bifrost: A value of bi_table to override the table, inducing a
     * DTSEL_IMM pair if nonzero.
@@ -1324,6 +1336,10 @@ typedef struct {
 
    /* Computed after RA */
    uint64_t spill_cost;
+
+   /* Placement of the inline constant pool emitted at pack time, if any */
+   unsigned constant_pool_size_B;
+   unsigned constant_pool_offset_B;
 } bi_context;
 
 static inline enum bi_round

@@ -916,11 +916,15 @@ static void *si_create_rs_state(struct pipe_context *ctx, const struct pipe_rast
                               SI_NGG_CULL_CLIP_PLANE_ENABLE(state->clip_plane_enable);
 
    if (!state->front_ccw) {
-      rs->ngg_cull_front = state->cull_face & PIPE_FACE_FRONT || rs->rasterizer_discard;
-      rs->ngg_cull_back = state->cull_face & PIPE_FACE_BACK || rs->rasterizer_discard;
+      rs->ngg_cull_face_negative_determinant = state->cull_face & PIPE_FACE_FRONT ||
+                                               rs->rasterizer_discard;
+      rs->ngg_cull_face_positive_determinant = state->cull_face & PIPE_FACE_BACK ||
+                                               rs->rasterizer_discard;
    } else {
-      rs->ngg_cull_front = state->cull_face & PIPE_FACE_BACK || rs->rasterizer_discard;
-      rs->ngg_cull_back = state->cull_face & PIPE_FACE_FRONT || rs->rasterizer_discard;
+      rs->ngg_cull_face_negative_determinant = state->cull_face & PIPE_FACE_BACK ||
+                                               rs->rasterizer_discard;
+      rs->ngg_cull_face_positive_determinant = state->cull_face & PIPE_FACE_FRONT ||
+                                               rs->rasterizer_discard;
    }
 
    /* Force gl_FrontFacing to true or false if the other face is culled. */
@@ -1678,10 +1682,10 @@ static void si_set_active_query_state(struct pipe_context *ctx, bool enable)
    if (enable) {
       /* Disable pipeline stats if there are no active queries. */
       if (sctx->num_hw_pipestat_streamout_queries)
-         si_clear_and_set_barrier_flags(sctx, SI_BARRIER_EVENT_PIPELINESTAT_STOP, SI_BARRIER_EVENT_PIPELINESTAT_START);
+         si_clear_and_set_barrier_flags(sctx, AC_BARRIER_PIPELINESTAT_STOP, AC_BARRIER_PIPELINESTAT_START);
    } else {
       if (sctx->num_hw_pipestat_streamout_queries)
-         si_clear_and_set_barrier_flags(sctx, SI_BARRIER_EVENT_PIPELINESTAT_START, SI_BARRIER_EVENT_PIPELINESTAT_STOP);
+         si_clear_and_set_barrier_flags(sctx, AC_BARRIER_PIPELINESTAT_START, AC_BARRIER_PIPELINESTAT_STOP);
    }
 
    /* Occlusion queries. */
@@ -1951,12 +1955,12 @@ static unsigned si_tex_mipfilter(unsigned filter)
 {
    switch (filter) {
    case PIPE_TEX_MIPFILTER_NEAREST:
-      return V_008F38_SQ_TEX_Z_FILTER_POINT;
+      return V_008F38_SQ_TEX_MIP_FILTER_POINT;
    case PIPE_TEX_MIPFILTER_LINEAR:
-      return V_008F38_SQ_TEX_Z_FILTER_LINEAR;
+      return V_008F38_SQ_TEX_MIP_FILTER_LINEAR;
    default:
    case PIPE_TEX_MIPFILTER_NONE:
-      return V_008F38_SQ_TEX_Z_FILTER_NONE;
+      return V_008F38_SQ_TEX_MIP_FILTER_NONE;
    }
 }
 
@@ -2476,10 +2480,8 @@ static void si_set_framebuffer_state(struct pipe_context *ctx,
     * when PA_SU_HARDWARE_SCREEN_OFFSET != 0 and any_scissor.BR_X/Y <= 0.
     * We could implement the full workaround here, but it's a useless case.
     */
-   if ((!state->width || !state->height) && (state->nr_cbufs || state->zsbuf.texture)) {
-      UNREACHABLE("the framebuffer shouldn't have zero area");
+   if ((!state->width || !state->height) && (state->nr_cbufs || state->zsbuf.texture))
       return;
-   }
 
    ASSERTED bool is_msaa_resolve = state->nr_cbufs == 2 &&
                                    state->cbufs[0].texture && state->cbufs[0].texture->nr_samples > 1 &&
@@ -4715,7 +4717,9 @@ static void si_pm4_emit_sqtt_pipeline(struct si_context *sctx, unsigned index)
 {
    struct si_pm4_state *state = sctx->queued.array[index];
 
-   si_pm4_emit_state(sctx, index);
+   /* like the rasterizer, this is re-emitted while it's bound */
+   si_pm4_emit_commands(sctx, &state->base);
+   sctx->emitted.array[index] = state;
 
    radeon_add_to_buffer_list(sctx, &sctx->gfx_cs, ((struct si_sqtt_fake_pipeline*)state)->bo,
                              RADEON_USAGE_READ | RADEON_PRIO_SHADER_BINARY);
