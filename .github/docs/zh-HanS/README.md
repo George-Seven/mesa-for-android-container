@@ -13,6 +13,7 @@ Forked From [Mesa - The 3D Graphics Library](https://gitlab.freedesktop.org/mesa
   - 对于部分 Adreno 6xx/7xx/8xx GPU，OpenGL、OpenGL ES、Vulkan 均可使用 Freedreno 驱动，不再需要使用 Zink 进行图形 API 调用转换，极大地提高了 GPU 的利用效率。
   - 只编译与绝大部分 Android 设备相关的驱动，减小包体体积。
   - 支持使用 [Termux:X11](https://github.com/termux/termux-x11)、[Anland](https://github.com/superturtlee/anland) 和 [Anland: Termux](https://github.com/lfdevs/anland-termux) 作为显示服务。
+  - 支持通过 [Termux:VA](https://github.com/lfdevs/termux-va) 进行硬件视频解码和编码，可以按照该指南来进行尝试：[Termux:VA User Guide](https://github.com/lfdevs/termux-va/blob/main/doc/user-guide.md)
 
 ## 兼容性
 这里只展示了经我和其他人实测后确认支持的 GPU 型号，**不代表其他的 GPU 型号不支持**。你可以在 [freedreno_devices.py](https://github.com/lfdevs/mesa-for-android-container/blob/turnip-main/src/freedreno/common/freedreno_devices.py) 文件中搜索你设备的 GPU 型号（例如，Adreno 725 可搜索`725`），若该型号有完整的设备定义，则它很可能受支持。欢迎在 [Issues](https://github.com/lfdevs/mesa-for-android-container/issues) 中分享驱动在你的设备上的运行情况，这将帮助我们完善下面的这张表。
@@ -23,7 +24,7 @@ Forked From [Mesa - The 3D Graphics Library](https://gitlab.freedesktop.org/mesa
 | **Adreno 710/720/722/730/732/735/740/750** |  ✔️支持  |   ✔️支持    |  ✔️支持  |
 |       **Adreno 810/829/830/840**       |  ✔️支持  |   ✔️支持    |  ✔️支持  |
 
-实验性支持（by [**whitebelyash**](https://github.com/whitebelyash)）：**Adreno 825**
+实验性支持：**Adreno 825**（by [**whitebelyash**](https://github.com/whitebelyash)）、**Adreno 850**
 
 ## 安装
 本项目的 Releases 有两种形式的安装包，一种可以使用 Linux 发行版的软件包管理器安装，另一种只能直接解压来安装。若需要最新的 Mesa 特性（如 **Adreno 8xx 的支持**）或者 Anland 支持，请使用 `26.3.0` 或更新版本的安装包。
@@ -40,7 +41,7 @@ Forked From [Mesa - The 3D Graphics Library](https://gitlab.freedesktop.org/mesa
 |    Debian 13     |            [25.0.7-2+deb13u1](https://github.com/lfdevs/mesa-for-android-container/releases/tag/debian%2F25.0.7-2-adreno)            |            [turnip-25.0.7-2+deb13u1](https://github.com/lfdevs/mesa-for-android-container/releases/tag/debian%2F25.0.7-2-turnip)            |
 | Ubuntu 24.04 LTS | [25.0.7-0ubuntu0.24.04.2](https://github.com/lfdevs/mesa-for-android-container/releases/tag/import%2F25.0.7-0ubuntu0.24.04.2-adreno) | [turnip-25.0.7-0ubuntu0.24.04.2](https://github.com/lfdevs/mesa-for-android-container/releases/tag/import%2F25.0.7-0ubuntu0.24.04.2-turnip) |
 |    Fedora 43     |             [25.2.7-4.fc43](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-25.2.7-4.fc43-adreno)             |               [turnip-25.2.7-4.fc43](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-25.2.7-4.fc43)                |
-|    Arch Linux    |               [26.3.0-1](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-26.3.0-devel-20260824)               |              [turnip-26.3.0-1](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-26.3.0-devel-20260824)              |
+|    Arch Linux    |               [27.0.0-90](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-27.0.0-devel-20261025)               |              [turnip-27.0.0-90](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-27.0.0-devel-20261025)              |
 
 若需要 Termux native 版本，请使用该 PR 的构建产物：<https://github.com/lfdevs/termux-packages/pull/25>
 
@@ -67,7 +68,7 @@ Forked From [Mesa - The 3D Graphics Library](https://gitlab.freedesktop.org/mesa
 
 | 标准安装包 | 未打补丁的 Turnip 安装包（通常不需要） |
 | :-: | :-: |
-| [26.3.0-devel-20260824](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-26.3.0-devel-20260824) | [turnip-26.3.0-devel-20260824](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-26.3.0-devel-20260824) |
+| [27.0.0-devel-20261025](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-27.0.0-devel-20261025) | [turnip-27.0.0-devel-20261025](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-27.0.0-devel-20261025) |
 
 > [!NOTE]
 > 对于 Adreno 7XX & 8XX，现在应该不再需要安装未打补丁的 Turnip 驱动了。标准安装包中打了补丁的 Turnip 驱动应该能正常运行。

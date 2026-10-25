@@ -13,6 +13,7 @@ A [Mesa](https://gitlab.freedesktop.org/mesa/mesa) build for containers on Andro
   - For some Adreno 6xx/7xx/8xx GPUs, the Freedreno driver can be used for OpenGL, OpenGL ES, and Vulkan, eliminating the need for Zink for graphics API call translation and significantly improving GPU utilization.
   - Only drivers relevant to the vast majority of Android devices are compiled to reduce the package size.
   - Supports using [Termux:X11](https://github.com/termux/termux-x11), [Anland](https://github.com/superturtlee/anland), and [Anland: Termux](https://github.com/lfdevs/anland-termux) as display services.
+  - Supports hardware video decoding and encoding through [Termux:VA](https://github.com/lfdevs/termux-va). You can follow this guide to try it out: [Termux:VA User Guide](https://github.com/lfdevs/termux-va/blob/main/doc/user-guide.md)
 
 ## Compatibility
 This section only displays GPU models confirmed to be supported through actual testing by me and others, **it does not mean that other GPU models are unsupported**. You can search for your device's GPU model in the [freedreno_devices.py](https://github.com/lfdevs/mesa-for-android-container/blob/turnip-main/src/freedreno/common/freedreno_devices.py) file (for example, search for `725` for Adreno 725). If the model has a complete device definition, it is likely supported. You are welcome to share how the driver runs on your device in [Issues](https://github.com/lfdevs/mesa-for-android-container/issues), which will help us improve the table below.
@@ -23,7 +24,7 @@ This section only displays GPU models confirmed to be supported through actual t
 | **Adreno 710/720/722/730/732/735/740/750** | ✔️ Supported | ✔️ Supported | ✔️ Supported |
 |       **Adreno 810/829/830/840**       | ✔️ Supported | ✔️ Supported | ✔️ Supported |
 
-Experimental support (by [**whitebelyash**](https://github.com/whitebelyash)): **Adreno 825**
+Experimental support: **Adreno 825** (by [**whitebelyash**](https://github.com/whitebelyash)), **Adreno 850**
 
 ## Installation
 This project's Releases provide two types of installation packages: one installable via the Linux distribution's package manager, and another that must be installed by direct extraction. If you need the latest Mesa features (such as **Adreno 8xx support**) or Anland support, please use an installation package of version `26.3.0` or newer.
@@ -40,7 +41,7 @@ Depending on your Linux distribution, go to [Releases](https://github.com/lfdevs
 |     Debian 13      |            [25.0.7-2+deb13u1](https://github.com/lfdevs/mesa-for-android-container/releases/tag/debian%2F25.0.7-2-adreno)            |            [turnip-25.0.7-2+deb13u1](https://github.com/lfdevs/mesa-for-android-container/releases/tag/debian%2F25.0.7-2-turnip)            |
 |  Ubuntu 24.04 LTS  | [25.0.7-0ubuntu0.24.04.2](https://github.com/lfdevs/mesa-for-android-container/releases/tag/import%2F25.0.7-0ubuntu0.24.04.2-adreno) | [turnip-25.0.7-0ubuntu0.24.04.2](https://github.com/lfdevs/mesa-for-android-container/releases/tag/import%2F25.0.7-0ubuntu0.24.04.2-turnip) |
 |     Fedora 43      |             [25.2.7-4.fc43](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-25.2.7-4.fc43-adreno)             |               [turnip-25.2.7-4.fc43](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-25.2.7-4.fc43)                |
-|     Arch Linux     |               [26.3.0-1](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-26.3.0-devel-20260824)               |              [turnip-26.3.0-1](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-26.3.0-devel-20260824)              |
+|     Arch Linux     |               [27.0.0-90](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-27.0.0-devel-20261025)               |              [turnip-27.0.0-90](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-27.0.0-devel-20261025)              |
 
 If you need the Termux native version, please use the build artifacts from this PR: <https://github.com/lfdevs/termux-packages/pull/25>
 
@@ -67,7 +68,7 @@ Currently, the "Direct Extraction" way supports the following Linux distribution
 
 | Standard Installation Package | Unpatched Turnip Installation Package (usually not needed) |
 | :-: | :-: |
-| [26.3.0-devel-20260824](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-26.3.0-devel-20260824) | [turnip-26.3.0-devel-20260824](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-26.3.0-devel-20260824) |
+| [27.0.0-devel-20261025](https://github.com/lfdevs/mesa-for-android-container/releases/tag/mesa-27.0.0-devel-20261025) | [turnip-27.0.0-devel-20261025](https://github.com/lfdevs/mesa-for-android-container/releases/tag/turnip-27.0.0-devel-20261025) |
 
 > [!NOTE]
 > For Adreno 7XX & 8XX, it should no longer be necessary to install unpatched Turnip drivers now. **Patched Turnip** from the standard release should work properly.
