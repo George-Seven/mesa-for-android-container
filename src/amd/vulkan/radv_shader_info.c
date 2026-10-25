@@ -302,6 +302,7 @@ gather_intrinsic_info(const nir_shader *nir, const nir_intrinsic_instr *instr, s
    case nir_intrinsic_vulkan_resource_index:
       info->desc_set_used_mask |= (1u << nir_intrinsic_desc_set(instr));
       break;
+   case nir_intrinsic_image_deref_descriptor_amd:
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_deref_sparse_load:
    case nir_intrinsic_image_deref_store:
@@ -445,9 +446,12 @@ radv_set_vs_output_param(enum amd_gfx_level gfx_level, const struct nir_shader *
    struct radv_vs_output_info *outinfo = &info->outinfo;
    uint64_t per_vtx_mask, per_prim_mask;
 
-   radv_get_output_masks(nir, gfx_state, &per_vtx_mask, &per_prim_mask);
-
    memset(outinfo->vs_output_param_offset, AC_EXP_PARAM_UNDEFINED, sizeof(outinfo->vs_output_param_offset));
+
+   if (gfx_state->rs.rasterizer_discard)
+      return;
+
+   radv_get_output_masks(nir, gfx_state, &per_vtx_mask, &per_prim_mask);
 
    /* Implicit primitive ID for VS and TES is added by ac_nir_lower_legacy_vs / ac_nir_lower_ngg,
     * it can be configured as either a per-vertex or per-primitive output depending on the GPU.
@@ -579,7 +583,6 @@ gather_shader_info_vs(const struct radv_compiler_info *compiler_info, const nir_
     */
    info->vs.needs_instance_id |= info->vs.has_prolog;
    info->vs.needs_base_instance |= info->vs.has_prolog;
-   info->vs.needs_draw_id |= info->vs.has_prolog;
 
    if (info->vs.dynamic_inputs) {
       info->vs.num_attributes = util_last_bit(info->vs.vb_desc_usage_mask);
@@ -880,9 +883,9 @@ gather_shader_info_fs(enum amd_gfx_level gfx_level, const nir_shader *nir,
       (gfx_state->ps.depth_output_needs_epilog && info->ps.writes_z) ||
       (gfx_state->ps.stencil_output_needs_epilog && info->ps.writes_stencil) ||
       (gfx_state->ps.sample_mask_output_needs_epilog && info->ps.writes_sample_mask) ||
-      (writes_mrt0_alpha && ((gfx_level >= GFX11 && gfx_state->ms.alpha_to_coverage_unknown &&
-                              (info->ps.writes_z || info->ps.writes_stencil || info->ps.writes_sample_mask)) ||
-                             (gfx_state->ms.alpha_to_coverage_unknown && gfx_state->ms.alpha_to_one_enable)));
+      (writes_mrt0_alpha &&
+       ((gfx_level >= GFX11 && gfx_state->ms.alpha_to_coverage_unknown && radv_ps_writes_mrtz(info)) ||
+        (gfx_state->ms.alpha_to_coverage_unknown && gfx_state->ms.alpha_to_one_enable)));
 
    if (!info->ps.has_epilog) {
       info->ps.mrt0_is_dual_src = gfx_state->ps.epilog.mrt0_is_dual_src;
@@ -896,23 +899,23 @@ gather_shader_info_fs(enum amd_gfx_level gfx_level, const nir_shader *nir,
 
       info->ps.writes_mrt0_alpha_to_mrtz =
          writes_mrt0_alpha && gfx_state->ms.alpha_to_coverage_enable &&
-         ((gfx_level >= GFX11 && (info->ps.writes_z || info->ps.writes_stencil || info->ps.writes_sample_mask)) ||
-          gfx_state->ms.alpha_to_one_enable);
+         ((gfx_level >= GFX11 && radv_ps_writes_mrtz(info)) || gfx_state->ms.alpha_to_one_enable);
    }
 
    if (gfx_level >= GFX10_3) {
       /* Disable VRS in these cases:
        *
-       * - if the fragment shader reads gl_SampleMaskIn because we expose fragmentShadingRateWithShaderSampleMask =
-       *   VK_FALSE because the SAMPLE_COVERAGE PS VGPR only contains a 16-bit sample coverage mask, which isn't
-       *   enough for 8xMSAA and 2x2 coarse shading (we no longer support 8xMSAA, so we could allow gl_SampleMaskIn
-       *   with VRS now).
+       * - if the fragment shader reads gl_SampleMaskIn or writes gl_SampleMask because we expose
+       *   fragmentShadingRateWithShaderSampleMask = VK_FALSE because the SAMPLE_COVERAGE PS VGPR only contains a
+       *   16-bit sample coverage mask, which isn't enough for 8xMSAA and 2x2 coarse shading (we no longer support
+       *   8xMSAA, so we could allow gl_SampleMaskIn with VRS now).
        * - on GFX10.3, if the fragment shader requests a fragment interlock execution mode even if the ordered
        *   section was optimized out, to consistently implement fragmentShadingRateWithFragmentShaderInterlock =
        *   VK_FALSE.
        */
       info->ps.force_disable_vrs =
          gfx_state->ms.sample_shading_enable || info->ps.uses_sample_shading || nir->info.fs.sample_mask_in_declared ||
+         nir->info.fs.sample_mask_out_declared ||
          (gfx_level == GFX10_3 && (nir->info.fs.sample_interlock_ordered || nir->info.fs.sample_interlock_unordered ||
                                    nir->info.fs.pixel_interlock_ordered || nir->info.fs.pixel_interlock_unordered));
 
@@ -1105,7 +1108,7 @@ radv_nir_shader_info_pass(const struct radv_compiler_info *compiler_info, const 
       outinfo->export_prim_id_per_primitive = per_prim_mask & VARYING_BIT_PRIMITIVE_ID;
    }
 
-   info->vs.needs_draw_id |= BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
+   info->needs_draw_id |= BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
    info->vs.needs_base_instance |= BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_BASE_INSTANCE);
    info->vs.needs_instance_id |= BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_INSTANCE_ID);
    info->uses_view_index |= BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_VIEW_INDEX);
@@ -1389,20 +1392,29 @@ radv_determine_ngg_settings(const struct radv_compiler_info *compiler_info, stru
       num_vertices_per_prim = mesa_vertices_per_prim(ngg_stage->nir->info.gs.output_primitive);
    }
 
-   ngg_stage->info.has_ngg_culling =
-      radv_consider_culling(compiler_info, ngg_stage->nir, ps_inputs_read, num_vertices_per_prim, &ngg_stage->info);
+   ngg_stage->info.has_ngg_culling = radv_consider_culling(compiler_info, ngg_stage->nir, ps_inputs_read,
+                                                           num_vertices_per_prim, &ngg_stage->info, gfx_state);
 
    if (ngg_stage->stage != MESA_SHADER_GEOMETRY) {
       nir_function_impl *impl = nir_shader_get_entrypoint(ngg_stage->nir);
       ngg_stage->info.has_ngg_early_prim_export =
          compiler_info->ac->gfx_level < GFX11 && exec_list_is_singular(&impl->body);
 
-      /* NGG passthrough mode should be disabled when culling and when the vertex shader
-       * exports the primitive ID.
+      /* NGG passthrough requires that the input and output topologies, vertex counts, and primitive
+       * counts are the same. NGG passthrough doesn't care about anything else the shader does,
+       * and the shader can still cull by flipping the cull bit in primitive exports.
+       *
+       * Since we reduce exported primitives and vertices to 0 with static rasterizer discard, NGG
+       * passthrough must be disabled with it.
+       *
+       * Behavior:
+       * - VGT_ESGS_RING_ITEMSIZE is ignored (behaving as if it was equal to 1)
+       * - vertex indices are packed into 1 VGPR to be passed as-is to the prim export
+       * - Navi23 and later chips can optionally skip the gs_alloc_req message
+       *
+       * If switching NGG passthrough on/off leads to unnecessary context rolls, we should stop using it.
        */
-      ngg_stage->info.is_ngg_passthrough =
-         !ngg_stage->info.has_ngg_culling &&
-         !(ngg_stage->stage == MESA_SHADER_VERTEX && ngg_stage->info.outinfo.export_prim_id);
+      ngg_stage->info.is_ngg_passthrough = !ngg_stage->info.has_ngg_culling && !gfx_state->rs.rasterizer_discard;
    }
 }
 
@@ -1528,6 +1540,7 @@ radv_nir_shader_info_merge(const struct radv_shader_stage *src, struct radv_shad
    dst_info->desc_set_used_mask |= src_info->desc_set_used_mask;
    dst_info->uses_view_index |= src_info->uses_view_index;
    dst_info->uses_prim_id |= src_info->uses_prim_id;
+   dst_info->needs_draw_id |= src_info->needs_draw_id;
    dst_info->inline_push_constant_mask |= src_info->inline_push_constant_mask;
 
    /* Only inline all push constants if both allows it. */

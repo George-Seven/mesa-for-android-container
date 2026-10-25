@@ -997,10 +997,6 @@ emit_vpc(fd_crb &crb, const struct program_builder *b)
       .viewidloc = linkage.viewid_loc,
    ));
 
-   if (b->hs) {
-      crb.add(PC_HS_PARAM_0(CHIP, b->hs->tess.tcs_vertices_out));
-   }
-
    if (b->gs) {
       uint32_t vertices_out, invocations, vec4_size;
       uint32_t prev_stage_output_size =
@@ -1277,15 +1273,26 @@ emit_fs_outputs(fd_crb &crb, const struct program_builder *b)
       .stencilref_regid = stencilref_regid,
    ));
 
-   for (uint32_t i = 0; i < output_reg_count; i++) {
-      crb.add(A6XX_SP_PS_OUTPUT_REG(i,
-         .regid          = fragdata_regid[i] & ~HALF_REG_ID,
-         .half_precision = fragdata_regid[i] & HALF_REG_ID,
-      ));
+   if (fs->fs.yuv_color) {
+      uint32_t regid = fragdata_regid[0] & ~HALF_REG_ID;
+      bool half = !!(fragdata_regid[0] & HALF_REG_ID);
 
-      if (VALIDREG(fragdata_regid[i]) ||
-          (fragdata_aliased_components & (0xf << (i * 4)))) {
-         b->state->mrt_components |= 0xf << (i * 4);
+      crb.add(A6XX_SP_PS_OUTPUT_REG(0, .regid = regid, .half_precision = half));
+      crb.add(A6XX_SP_PS_OUTPUT_REG(1, .regid = regid, .half_precision = half));
+
+      b->state->mrt_components |= 0xf;
+      b->state->mrt_components |= 0xf << 4;
+   } else {
+      for (uint32_t i = 0; i < output_reg_count; i++) {
+         crb.add(A6XX_SP_PS_OUTPUT_REG(i,
+            .regid          = fragdata_regid[i] & ~HALF_REG_ID,
+            .half_precision = fragdata_regid[i] & HALF_REG_ID,
+         ));
+
+         if (VALIDREG(fragdata_regid[i]) ||
+             (fragdata_aliased_components & (0xf << (i * 4)))) {
+            b->state->mrt_components |= 0xf << (i * 4);
+         }
       }
    }
 
@@ -1334,6 +1341,8 @@ setup_stateobj(fd_cs &cs, const struct program_builder *b)
 
       const uint32_t wavesize = 64;
       const uint32_t vs_hs_local_mem_size = 16384;
+
+      crb.add(PC_HS_PARAM_0(CHIP, MAX2(patch_control_points, b->hs->tess.tcs_vertices_out)));
 
       uint32_t max_patches_per_wave;
       if (b->ctx->screen->info->props.tess_use_shared) {

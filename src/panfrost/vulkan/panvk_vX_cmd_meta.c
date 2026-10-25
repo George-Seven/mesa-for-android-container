@@ -33,6 +33,47 @@ copy_to_image_use_gfx_pipeline(struct panvk_image *dst_img)
    return false;
 }
 
+#if PAN_ARCH >= 10
+/* Compute copies bypass framebuffer CRC tracking, so writes touching the
+ * mip-0 CRC region must invalidate its state explicitly.
+ */
+static bool
+copy_buffer_to_image_touches_crc(const struct panvk_image *dst_img,
+                                 const VkCopyDeviceMemoryImageInfoKHR *info)
+{
+   if (!panvk_image_plane_crc_header_addr(dst_img))
+      return false;
+
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageSubresourceLayers *dst = &info->pRegions[i].imageSubresource;
+
+      if (dst->mipLevel == 0 &&
+          panvk_plane_index(dst_img, dst->aspectMask) == 0)
+         return true;
+   }
+
+   return false;
+}
+
+static bool
+copy_image_touches_crc(const struct panvk_image *dst_img,
+                       const VkCopyImageInfo2 *info)
+{
+   if (!panvk_image_plane_crc_header_addr(dst_img))
+      return false;
+
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageSubresourceLayers *dst = &info->pRegions[i].dstSubresource;
+
+      if (dst->mipLevel == 0 &&
+          panvk_plane_index(dst_img, dst->aspectMask) == 0)
+         return true;
+   }
+
+   return false;
+}
+#endif /* PAN_ARCH >= 10 */
+
 static void
 meta_compute_start(struct panvk_cmd_buffer *cmdbuf,
                    struct panvk_cmd_meta_compute_save_ctx *save_ctx)
@@ -205,7 +246,6 @@ meta_gfx_end(struct panvk_cmd_buffer *cmdbuf,
    cmdbuf->state.gfx.vs.attrib_bufs = 0;
    cmdbuf->state.gfx.vs.indirect_attribs_infos = 0;
    cmdbuf->state.gfx.vs.indirect_attrib_bufs_infos = 0;
-   cmdbuf->state.gfx.vs.indirect_varying_bufs_infos = 0;
    cmdbuf->state.gfx.fs.rsd = 0;
 #else
    cmdbuf->state.gfx.fs.desc.res_table = 0;
@@ -460,6 +500,15 @@ panvk_per_arch(CmdCopyMemoryToImageKHR)(
       struct panvk_cmd_meta_compute_save_ctx save = {0};
 
       meta_compute_start(cmdbuf, &save);
+#if PAN_ARCH >= 10
+      if (copy_buffer_to_image_touches_crc(img, pCopyMemoryInfo)) {
+         struct cs_builder *b =
+            panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+
+         panvk_per_arch(cmd_invalidate_crc)(
+            b, panvk_image_plane_crc_header_addr(img));
+      }
+#endif
       vk_meta_copy_memory_to_image(&cmdbuf->vk, &dev->meta,
                                    pCopyMemoryInfo, &img_props,
                                    VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -655,6 +704,15 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
       struct panvk_cmd_meta_compute_save_ctx save = {0};
 
       meta_compute_start(cmdbuf, &save);
+#if PAN_ARCH >= 10
+      if (copy_image_touches_crc(dst_img, pCopyImageInfo)) {
+         struct cs_builder *b =
+            panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+
+         panvk_per_arch(cmd_invalidate_crc)(
+            b, panvk_image_plane_crc_header_addr(dst_img));
+      }
+#endif
       vk_meta_copy_image(&cmdbuf->vk, &dev->meta, pCopyImageInfo,
                          &src_img_props, &dst_img_props,
                          VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -672,6 +730,7 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
    unsigned color_att_count =
       util_last_bit(bound_atts & MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS);
    VkRenderingAttachmentInfo color_atts[MAX_RTS];
+   VkRenderingAttachmentFlagsInfoKHR color_att_flags[MAX_RTS];
    for (uint32_t i = 0; i < color_att_count; i++) {
 
       const struct panvk_resolve_attachment *resolve_info =
@@ -679,8 +738,14 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
       struct panvk_image_view *src_iview =
          cmdbuf->state.gfx.render.color_attachments.iviews[i];
 
+      color_att_flags[i] = (VkRenderingAttachmentFlagsInfoKHR){
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+         .flags = resolve_info->flags,
+      };
+
       color_atts[i] = (VkRenderingAttachmentInfo){
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .pNext = &color_att_flags[i],
          .imageView = panvk_image_view_to_handle(src_iview),
          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
          .resolveMode = resolve_info->mode,

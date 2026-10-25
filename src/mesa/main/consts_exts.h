@@ -220,6 +220,7 @@ struct gl_extensions
    GLboolean EXT_timer_query;
    GLboolean EXT_vertex_array_bgra;
    GLboolean EXT_window_rectangles;
+   GLboolean EXT_YUV_target;
    GLboolean OES_copy_image;
    GLboolean OES_primitive_bounding_box;
    GLboolean OES_sample_variables;
@@ -262,6 +263,7 @@ struct gl_extensions
    GLboolean KHR_texture_compression_astc_ldr;
    GLboolean KHR_texture_compression_astc_sliced_3d;
    GLboolean MESA_framebuffer_flip_y;
+   GLboolean MESA_map_buffer_client_pointer;
    GLboolean MESA_texture_const_bandwidth;
    GLboolean MESA_pack_invert;
    GLboolean MESA_tile_raster_order;
@@ -531,6 +533,12 @@ struct gl_constants
     * with "#version ForceGLSLVersion".
     */
    GLuint ForceGLSLVersion;
+
+   /**
+    * For GLSL shaders that don't begin with "#version <version>",
+    * this version is used.
+    */
+   GLuint DefaultGLSLVersion;
 
    /**
     * Allow GLSL #extension directives in the middle of shaders.
@@ -904,6 +912,12 @@ struct gl_constants
    bool PackedDriverUniformStorage;
 
    bool HasFBFetch;
+
+   /** Bitmask of enum pipe_advanced_blend_mode blended natively by the
+    * driver. Modes that aren't set in the mask are lowered into the
+    * fragment shader using framebuffer fetch.
+    */
+   GLbitfield NativeAdvancedBlendModes;
 
    bool PointSizeFixed;
 

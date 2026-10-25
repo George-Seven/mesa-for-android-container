@@ -54,6 +54,7 @@ static void blorp_measure_end(struct blorp_batch *_batch,
                          params->op,
                          params->x1 - params->x0,
                          params->y1 - params->y0,
+                         params->num_layers,
                          params->num_samples,
                          params->shader_pipeline,
                          params->depth.enabled ? params->depth.view.format :
@@ -79,7 +80,7 @@ blorp_emit_reloc(struct blorp_batch *batch,
       .bo = address.buffer,
       .offset = address.offset,
    };
-   anv_reloc_list_add_bo(cmd_buffer->batch.relocs, anv_addr.bo);
+   anv_cmd_buffer_add_reloc_bo(cmd_buffer, anv_addr.bo);
    return anv_address_physical(anv_address_add(anv_addr, delta));
 }
 

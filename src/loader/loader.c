@@ -128,7 +128,8 @@ bool
 amd_predicate(int fd, const char *driver)
 {
    char *kernel_driver = loader_get_kernel_driver_name(fd);
-   bool ret = kernel_driver && (strcmp(kernel_driver, "amdgpu") == 0);
+   bool ret = kernel_driver &&
+              (strcmp(kernel_driver, "amdgpu") == 0 || strcmp(kernel_driver, "radeon") == 0);
 
    free(kernel_driver);
    return ret;
@@ -769,7 +770,7 @@ loader_get_pci_driver(int fd)
    }
 
 out:
-   log_(driver ? _LOADER_DEBUG : _LOADER_WARNING,
+   log_(driver ? _LOADER_DEBUG : _LOADER_INFO,
          "pci id for fd %d: %04x:%04x, driver %s\n",
          fd, vendor_id, chip_id, driver);
    return driver;

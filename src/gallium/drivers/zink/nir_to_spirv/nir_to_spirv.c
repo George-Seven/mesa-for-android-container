@@ -3598,6 +3598,7 @@ emit_subgroup_rotate(struct ntv_context *ctx, nir_intrinsic_instr *intr)
 {
    SpvOp op = SpvOpGroupNonUniformRotateKHR;
    spirv_builder_emit_cap(&ctx->builder, SpvCapabilityGroupNonUniformRotateKHR);
+   spirv_builder_emit_extension(&ctx->builder, "SPV_KHR_subgroup_rotate");
 
    nir_alu_type atype, unused;
    SpvId src0 = get_src(ctx, &intr->src[0], &atype);
@@ -5690,17 +5691,21 @@ lower_vri_to_var_instr(nir_builder *b, nir_instr *instr, void *data)
    int binding = nir_intrinsic_binding(vri);
    nir_variable *var = NULL;
    nir_foreach_variable_with_modes(i, b->shader, deref->modes) {
-      if (i->data.descriptor_set == desc_set && i->data.binding == binding) {
+      if (i->data.descriptor_set == desc_set && i->data.binding == binding &&
+          glsl_without_array(i->type) == deref->type) {
          var = i;
          break;
       }
    }
+
    if (!var)
       return false;
 
    b->cursor = nir_after_instr(instr);
    nir_deref_instr *var_deref = nir_build_deref_var(b, var);
    fixup_deref_components(deref);
+   if (glsl_type_is_array(var->type))
+      var_deref = nir_build_deref_array(b, var_deref, vri->src[0].ssa);
    nir_def_rewrite_uses_after_instr(&deref->def, &var_deref->def, instr);
 
    return true;

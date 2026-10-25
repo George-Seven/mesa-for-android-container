@@ -11,6 +11,7 @@
 #include "util/os_time.h"
 #include "util/u_process.h"
 #include "util/u_math.h"
+#include "util/u_string.h"
 
 #include "ac_shader_util.h"
 #include "ac_spm.h"
@@ -194,8 +195,9 @@ static void ac_sqtt_fill_cpu_info(struct sqtt_file_chunk_cpu_info *chunk)
       str = strstr(line, "vendor_id");
       if (str) {
          char *ptr = (char *)chunk->vendor_id;
-         char *v = strtok(str, ":");
-         v = strtok(NULL, ":");
+         char *saveptr;
+         char *v = strtok_r(str, ":", &saveptr);
+         v = strtok_r(NULL, ":", &saveptr);
          strncpy(ptr, v + 1, sizeof(chunk->vendor_id) - 1);
          ptr[sizeof(chunk->vendor_id) - 1] = '\0';
       }
@@ -204,8 +206,9 @@ static void ac_sqtt_fill_cpu_info(struct sqtt_file_chunk_cpu_info *chunk)
       str = strstr(line, "model name");
       if (str) {
          char *ptr = (char *)chunk->processor_brand;
-         char *v = strtok(str, ":");
-         v = strtok(NULL, ":");
+         char *saveptr;
+         char *v = strtok_r(str, ":", &saveptr);
+         v = strtok_r(NULL, ":", &saveptr);
          strncpy(ptr, v + 1, sizeof(chunk->processor_brand) - 1);
          ptr[sizeof(chunk->processor_brand) - 1] = '\0';
       }
@@ -1425,7 +1428,7 @@ ac_dump_rgp_capture(const struct radeon_info *info, struct ac_sqtt_trace *sqtt_t
    FILE *f;
 
    t = time(NULL);
-   now = *localtime(&t);
+   os_localtime(&t, &now);
 
    if (capture_info) {
       snprintf(info_str, sizeof(info_str), "_%s%d",
@@ -1455,4 +1458,42 @@ ac_dump_rgp_capture(const struct radeon_info *info, struct ac_sqtt_trace *sqtt_t
    fclose(f);
    return 0;
 #endif
+}
+
+void
+ac_rgp_flush_bits_to_barrier_marker(enum ac_rgp_flush_bits flush_bits,
+                                    struct rgp_sqtt_marker_barrier_end *marker)
+{
+   if (flush_bits & AC_RGP_FLUSH_WAIT_ON_EOP_TS)
+      marker->wait_on_eop_ts = true;
+   if (flush_bits & AC_RGP_FLUSH_VS_PARTIAL_FLUSH)
+      marker->vs_partial_flush = true;
+   if (flush_bits & AC_RGP_FLUSH_PS_PARTIAL_FLUSH)
+      marker->ps_partial_flush = true;
+   if (flush_bits & AC_RGP_FLUSH_CS_PARTIAL_FLUSH)
+      marker->cs_partial_flush = true;
+   if (flush_bits & AC_RGP_FLUSH_PFP_SYNC_ME)
+      marker->pfp_sync_me = true;
+   if (flush_bits & AC_RGP_FLUSH_SYNC_CP_DMA)
+      marker->sync_cp_dma = true;
+   if (flush_bits & AC_RGP_FLUSH_INVAL_VMEM_L0)
+      marker->inval_tcp = true;
+   if (flush_bits & AC_RGP_FLUSH_INVAL_ICACHE)
+      marker->inval_sqI = true;
+   if (flush_bits & AC_RGP_FLUSH_INVAL_SMEM_L0)
+      marker->inval_sqK = true;
+   if (flush_bits & AC_RGP_FLUSH_FLUSH_L2)
+      marker->flush_tcc = true;
+   if (flush_bits & AC_RGP_FLUSH_INVAL_L2)
+      marker->inval_tcc = true;
+   if (flush_bits & AC_RGP_FLUSH_FLUSH_CB)
+      marker->flush_cb = true;
+   if (flush_bits & AC_RGP_FLUSH_INVAL_CB)
+      marker->inval_cb = true;
+   if (flush_bits & AC_RGP_FLUSH_FLUSH_DB)
+      marker->flush_db = true;
+   if (flush_bits & AC_RGP_FLUSH_INVAL_DB)
+      marker->inval_db = true;
+   if (flush_bits & AC_RGP_FLUSH_INVAL_L1)
+      marker->inval_gl1 = true;
 }

@@ -71,7 +71,9 @@ translate_image(struct fd5_image *img, struct pipe_image_view *pimg)
       /* size is encoded with low 15b in WIDTH and high bits in
        * HEIGHT, in units of elements:
        */
-      unsigned sz = pimg->u.buf.size / util_format_get_blocksize(format);
+      unsigned sz = fd_clamp_buffer_size(format, pimg->u.buf.size,
+                                         A4XX_MAX_TEXEL_BUFFER_ELEMENTS_UINT) /
+                    util_format_get_blocksize(format);
       img->width = sz & MASK(15);
       img->height = sz >> 15;
       img->depth = 0;
@@ -167,8 +169,9 @@ emit_image_ssbo(struct fd_ringbuffer *ring, unsigned slot,
    OUT_RING(ring, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
                      CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
    OUT_RING(ring, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
-   OUT_RING(ring,
-            A5XX_SSBO_1_0_FMT(img->fmt) | A5XX_SSBO_1_0_WIDTH(img->width));
+   OUT_RING(ring, A5XX_SSBO_1_0_FMT(img->fmt) |
+                     A5XX_SSBO_1_0_SWAP(fd5_pipe2swap(img->pfmt)) |
+                     A5XX_SSBO_1_0_WIDTH(img->width));
    OUT_RING(ring, A5XX_SSBO_1_1_HEIGHT(img->height) |
                      A5XX_SSBO_1_1_DEPTH(img->depth));
 

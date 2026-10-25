@@ -350,32 +350,20 @@ jay_grow_sources(jay_builder *b, jay_inst *I, uint8_t new_num_srcs)
 }
 
 static inline jay_inst *
-jay_add_predicate_else(jay_builder *b,
-                       jay_inst *I,
-                       jay_def predicate,
-                       jay_def default_value)
+jay_add_predicate(jay_builder *b, jay_inst *I, jay_def pred, jay_def default_)
 {
    assert(!I->predication && "pre-condition");
-   assert(jay_is_flag(predicate) && jay_is_ssa(default_value));
+   assert(jay_is_flag(pred) && (jay_is_ssa(default_) || jay_is_null(default_)));
 
    unsigned pred_index = I->num_srcs;
-   I = jay_grow_sources(b, I, pred_index + 2);
-   I->src[pred_index] = predicate;
-   I->src[pred_index + 1] = default_value;
-   I->predication = JAY_PREDICATED_DEFAULT;
-   return I;
-}
+   I->predication = jay_is_null(default_) ? 1 : 2;
+   I = jay_grow_sources(b, I, pred_index + I->predication);
+   I->src[pred_index] = pred;
 
-static inline jay_inst *
-jay_add_predicate(jay_builder *b, jay_inst *I, jay_def predicate)
-{
-   assert(!I->predication && "pre-condition");
-   assert(jay_is_flag(predicate));
+   if (I->predication == 2) {
+      I->src[pred_index + 1] = default_;
+   }
 
-   unsigned pred_index = I->num_srcs;
-   I = jay_grow_sources(b, I, pred_index + 1);
-   I->src[pred_index] = predicate;
-   I->predication = JAY_PREDICATED;
    return I;
 }
 
@@ -469,12 +457,16 @@ struct jayb_send_params {
    enum jay_type src_type[2];
    unsigned nr_srcs;
    uint32_t ex_desc_imm;
+   unsigned simd_width;
    int split; /**< explicit split point */
    bool eot;
    bool uniform;
    bool bindless;
    bool pure;
    bool skip_helpers;
+   /* if true, don't include mlen in ex_desc */
+   bool use_raw_ex_desc;
+   uint8_t explicit_simd_width;
 };
 
 static inline jay_inst *
@@ -483,6 +475,7 @@ _jay_SEND(jay_builder *b, const struct jayb_send_params p)
    const struct intel_device_info *devinfo = b->shader->devinfo;
    jay_inst *I = jay_alloc_inst(b, JAY_OPCODE_SEND, 4, sizeof(jay_send_info));
    jay_send_info *info = jay_get_send_info(I);
+   info->explicit_simd_width = p.explicit_simd_width;
    bool has_header = !jay_is_null(p.header);
 
    I->dst = p.dst;
@@ -492,6 +485,14 @@ _jay_SEND(jay_builder *b, const struct jayb_send_params p)
    assert(I->type);
    info->type_0 = p.src_type[0] ? p.src_type[0] : I->type;
    info->type_1 = p.src_type[1] ? p.src_type[1] : info->type_0;
+
+   /* We don't do true SIMD32 on Xe1, so clamp */
+   unsigned simd = p.simd_width ? p.simd_width : b->shader->dispatch_width;
+   unsigned native_simd = devinfo->ver < 20 ? 8 : 16;
+   simd = MIN2(simd, native_simd * 2);
+
+   I->simd_split =
+      I->uniform ? 0 : util_logbase2(b->shader->dispatch_width / simd);
 
    if (has_header) {
       assert(p.nr_srcs == 1 || info->type_0 == info->type_1);
@@ -505,7 +506,7 @@ _jay_SEND(jay_builder *b, const struct jayb_send_params p)
       info->type_0 = JAY_TYPE_U32 /* header type */;
    } else if (jay_type_size_bits(info->type_0) == 16 &&
               !p.uniform &&
-              b->shader->dispatch_width == 32) {
+              simd == (native_simd * 2)) {
       /* Pack 16-bit vectors to match the hardware with the data model.
        *
        * XXX: This is a hack. Move to NIR for better
@@ -554,10 +555,8 @@ _jay_SEND(jay_builder *b, const struct jayb_send_params p)
       I->src[3] = jay_collect_vectors(b, &p.srcs[split], p.nr_srcs - split);
    }
 
-   if (jay_type_size_bits(p.type) == 16 &&
-       !p.uniform &&
-       b->shader->dispatch_width == 32) {
-      unsigned stride = b->shader->dispatch_width / 2;
+   if (jay_type_size_bits(p.type) == 16 && !p.uniform && simd == 32) {
+      unsigned stride = simd / 2;
       I->dst = jay_alloc_def(b, UGPR, stride * jay_num_values(I->dst));
    }
 
@@ -585,7 +584,7 @@ _jay_SEND(jay_builder *b, const struct jayb_send_params p)
       if (x.file == UGPR) {
          lens[i] = DIV_ROUND_UP(lens[i], jay_ugpr_per_grf(b->shader));
       } else {
-         lens[i] *= jay_grf_per_gpr(b->shader);
+         lens[i] *= jay_grf_per_gpr_at_width(b->shader, simd);
       }
 
       lens[i] *= reg_unit(devinfo);
@@ -612,10 +611,17 @@ _jay_SEND(jay_builder *b, const struct jayb_send_params p)
       I->src[1] =
          jay_imm(brw_message_ex_desc(devinfo, lens[2]) | (p.msg_desc >> 32));
    } else if (p.ex_desc.file == J_ADDRESS) {
+      /* p.ex_desc should end up in an address register, so use it if it is
+       * provided in one already. this is necessary for anything generating
+       * SENDs after jay_lower_pre_ra (e.g. spills/fills).
+       */
       I->src[1] = p.ex_desc;
    } else {
-      I->src[1] = jay_alloc_def(b, J_ADDRESS, 1);
-      if (info->bindless) {
+      /* Otherwise we assume jay_lower_pre_ra will move it to an address
+       * register, so we can just stuff it in a UGPR for now.
+       */
+      I->src[1] = jay_alloc_def(b, UGPR, 1);
+      if (info->bindless || p.use_raw_ex_desc) {
          jay_MOV(b, I->src[1], p.ex_desc);
       } else {
          jay_OR(b, JAY_TYPE_U32, I->src[1], p.ex_desc,
@@ -623,7 +629,7 @@ _jay_SEND(jay_builder *b, const struct jayb_send_params p)
       }
    }
 
-   if (p.uniform && b->shader->helpers_tracked) {
+   if (p.uniform && b->shader->helpers_tracked && p.skip_helpers) {
       I->cond_flag = jay_alloc_def(b, FLAG, 1);
    }
 
@@ -634,7 +640,7 @@ _jay_SEND(jay_builder *b, const struct jayb_send_params p)
        *
        * XXX: This is a hack.
        */
-      unsigned stride = b->shader->dispatch_width / 2;
+      unsigned stride = simd / 2;
       assert(stride % jay_ugpr_per_grf(b->shader) == 0);
       for (unsigned i = 0; i < jay_num_values(p.dst); ++i) {
          jay_def src = jay_extract_range(I->dst, i * stride, stride);

@@ -179,7 +179,7 @@ etna_emit_alu(struct etna_compile *c, nir_alu_instr *alu, struct etna_inst_dst d
    case nir_op_flog2:
    case nir_op_fsin:
    case nir_op_fcos:
-      if (c->specs->has_new_transcendentals)
+      if (etna_core_has_feature(c->info, ETNA_FEATURE_HAS_FAST_TRANSCENDENTALS))
          inst.rounding = ISA_ROUNDING_RTZ;
       FALLTHROUGH;
    case nir_op_frsq:
@@ -188,8 +188,8 @@ etna_emit_alu(struct etna_compile *c, nir_alu_instr *alu, struct etna_inst_dst d
    case nir_op_fsqrt:
    case nir_op_imul:
       /* scalar instructions we want src to be in x component */
-      inst.src[0].swiz = inst_swiz_compose(src[0].swiz, swiz_scalar);
-      inst.src[1].swiz = inst_swiz_compose(src[1].swiz, swiz_scalar);
+      inst.src[0] = etna_src_swizzle(src[0], swiz_scalar);
+      inst.src[1] = etna_src_swizzle(src[1], swiz_scalar);
       break;
    /* deal with instructions which don't have 1:1 mapping */
    case nir_op_fmin:
@@ -274,6 +274,13 @@ etna_emit_tex(struct etna_compile *c, nir_tex_instr * tex, unsigned dst_swiz,
       inst.opcode = ISA_OPC_TXF;
       inst.src[2] = etna_immediate_int(0x1100);
       break;
+   case nir_texop_txf_ms: {
+      int ms_index = nir_tex_instr_src_index(tex, nir_tex_src_ms_index);
+
+      inst.opcode = ISA_OPC_TXF_MS;
+      inst.src[1] = etna_immediate_int(nir_src_as_int(tex->src[ms_index].src));
+      break;
+   }
    case nir_texop_tg4:
       inst.opcode = ISA_OPC_TG4;
       inst.src[1] = etna_immediate_int(tex->component);

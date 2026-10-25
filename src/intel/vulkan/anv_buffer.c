@@ -240,7 +240,7 @@ VkResult anv_CreateBuffer(
       if (buffer->vk.usage & (VK_BUFFER_USAGE_2_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
                               VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
                               VK_BUFFER_USAGE_2_DESCRIPTOR_HEAP_BIT_EXT)) {
-         alloc_flags |= ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL;
+         alloc_flags |= device->physical->uses_efficient_64bit ? ANV_BO_ALLOC_DESCRIPTOR_POOL : ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL;
       }
 
       VkResult result = anv_init_sparse_bindings(device, buffer->vk.size,
@@ -311,7 +311,10 @@ uint64_t anv_GetBufferOpaqueCaptureAddress(
 {
    ANV_FROM_HANDLE(anv_buffer, buffer, pInfo->buffer);
 
-   return anv_address_physical(buffer->address);
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+      return anv_address_physical(buffer->address);
+   else
+      return 0;
 }
 
 VkResult anv_GetBufferOpaqueCaptureDescriptorDataEXT(
@@ -321,7 +324,11 @@ VkResult anv_GetBufferOpaqueCaptureDescriptorDataEXT(
 {
    ANV_FROM_HANDLE(anv_buffer, buffer, pInfo->buffer);
 
-   *((uint64_t *)pData) = anv_address_physical(buffer->address);
+   uint64_t address = anv_address_physical(buffer->address);
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+      memcpy(pData, &address, sizeof(address));
+   else
+      memset(pData, 0, sizeof(address));
 
    return VK_SUCCESS;
 }

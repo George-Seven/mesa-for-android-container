@@ -74,6 +74,10 @@ gl_cts_commits_to_backport=(
   bf307df9e5c6c27499c2c799409d17554d39cafc
   # Fix a memory leak with the texture image sample tests
   5d392ccf4fa09d38d06ca66875a2aaac4fde2b11
+  # Update the SHA of gl.xml for GL_map_buffer_client_pointer desktop OpenGL support
+  14906370e647d1a5ad584b800052a46cf4df04ca
+  # Add valid GL_MAP_CLIENT_POINTER_BIT_MESA bit to storageFlags.
+  ae0462f96eb56c295b98372d1780c8608c4970ad
 )
 
 # shellcheck disable=SC2034
@@ -96,11 +100,21 @@ gles_cts_commits_to_backport=(
   bf307df9e5c6c27499c2c799409d17554d39cafc
   # Fix a memory leak with the texture image sample tests
   5d392ccf4fa09d38d06ca66875a2aaac4fde2b11
+  # Fix GLES2 sized depth sampling
+  758d0f50723d3f1ce1dd8141fb2b5f8698c54bd1
+  # Fix GLES2 limited NPOT completeness tests
+  527f723b666547c34b45522ef25a116107b5c540
+  # Fix GLES2 3D filtering without full NPOT support
+  a3918c1dd4f409c28b3a85cc89e9875ff2ca864c
+  # Allow half float R/RG/RGB to be color-renderable for ES2
+  3e98747abfc47130a9f854ab1130b86d494de260
 )
 
 # shellcheck disable=SC2034
 gles_cts_patch_files=(
   build-deqp-gl_Build-Don-t-build-Vulkan-utilities-for-GL-builds.patch
+  # 7a498100 adjusted for the GLES CTS 3.2.14.1 mustpass lists
+  build-deqp-Fix-gles2-internalformat-texture-float-tests.patch
 )
 
 

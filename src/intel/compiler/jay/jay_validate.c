@@ -57,7 +57,7 @@ chirp(struct validate_state *validate, const char *fmt, ...)
    if (validate->I) {
       fprintf(stderr,
               "   invalid instruction in block %d: ", validate->block->index);
-      jay_print_inst(stderr, validate->block, validate->I, NULL);
+      jay_print_inst(stderr, validate->func, validate->I);
    }
    fprintf(stderr, "   ");
    vfprintf(stderr, fmt, args);
@@ -101,7 +101,7 @@ get_src_words(struct validate_state *validate, jay_inst *I, unsigned s)
       return 8;
    }
 
-   if (I->op == JAY_OPCODE_ZIP_UGPR16) {
+   if (I->op == JAY_OPCODE_ZIP) {
       return jay_ugpr_per_grf(shader);
    }
 
@@ -213,7 +213,7 @@ validate_def(struct validate_state *validate,
          jay_is_null(def) ||
          jay_simd_width_logical(validate->func->shader, I) > 1 ||
          I->op == JAY_OPCODE_SHUFFLE ||
-         I->op == JAY_OPCODE_VECTOR_EXTRACT ||
+         I->op == JAY_OPCODE_MOV_INDIRECT ||
          I->op == JAY_OPCODE_BROADCAST_IMM);
 }
 
@@ -278,10 +278,12 @@ validate_inst(struct validate_state *validate, jay_inst *I)
    if (I->predication) {
       CHECK(num_srcs >= I->predication);
 
-      if (jay_inst_has_default(I)) {
-         jay_def dst = jay_is_null(I->dst) ? I->cond_flag : I->dst;
-         CHECK(jay_normalize_uflag(jay_inst_get_default(I)->file) ==
-               jay_normalize_uflag(dst.file));
+      jay_def dsts[] = { jay_is_null(I->dst) ? I->cond_flag : I->dst,
+                         I->cond_flag };
+      for (unsigned i = 1; i < I->predication; ++i) {
+         jay_def def = I->src[I->num_srcs - I->predication + i];
+         CHECK(jay_normalize_uflag(def.file) ==
+               jay_normalize_uflag(dsts[i - 1].file));
       }
 
       CHECK(jay_is_flag(*jay_inst_get_predicate(I)));
@@ -305,7 +307,8 @@ validate_inst(struct validate_state *validate, jay_inst *I)
          unsigned expected = get_src_words(validate, I, s);
          unsigned words = jay_num_values(I->src[s]);
          if ((I->op != JAY_OPCODE_SEND || s < 2) &&
-             I->op != JAY_OPCODE_VECTOR_EXTRACT &&
+             I->op != JAY_OPCODE_SHUFFLE &&
+             I->op != JAY_OPCODE_MOV_INDIRECT &&
              I->op != JAY_OPCODE_BROADCAST_IMM) {
             CHECK(expected == words);
          }
@@ -331,12 +334,18 @@ validate_inst(struct validate_state *validate, jay_inst *I)
       CHECK(jay_is_flag(I->src[2]) && "SEL src[2] (selector) must be a flag");
    } else if (I->op == JAY_OPCODE_SYNC) {
       CHECK(validate->post_ra && "SYNC does not exist while scheduling");
-   } else if (I->op == JAY_OPCODE_ZIP_UGPR16) {
+   } else if (I->op == JAY_OPCODE_ZIP) {
+      unsigned ugpr_per_grf = jay_ugpr_per_grf(validate->func->shader);
       CHECK(I->dst.file == GPR);
-      CHECK(I->src[0].file == UGPR && I->src[1].file == UGPR);
-      CHECK(jay_num_values(I->src[0]) == 16);
-      CHECK(jay_num_values(I->src[1]) == 16);
-      CHECK(jay_grf_per_gpr(validate->func->shader) == 2);
+
+      jay_foreach_src(I, s) {
+         if (s < jay_grf_per_gpr(validate->func->shader)) {
+            CHECK(I->src[s].file == UGPR &&
+                  jay_num_values(I->src[s]) == ugpr_per_grf);
+         } else {
+            CHECK(jay_is_null(I->src[s]));
+         }
+      }
    } else if (I->op == JAY_OPCODE_SLICE_REPACK) {
       const bool unpack = jay_slice_repack_unpack(I);
       const unsigned pf = 1 << jay_slice_repack_factor_log2(I);

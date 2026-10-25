@@ -83,8 +83,6 @@ struct kk_shader_info {
          } stencil_front, stencil_back;
          uint8_t color_attachment_count;
          bool has_ms;
-         bool has_alpha_to_coverage_enabled;
-         bool has_alpha_to_one_enabled;
          bool has_ds;
          bool has_depth_write;
          bool has_stencil_test;
@@ -160,6 +158,9 @@ kk_nir_lower_descriptors(nir_shader *nir,
                          const struct vk_pipeline_robustness_state *rs,
                          uint32_t set_layout_count,
                          struct vk_descriptor_set_layout *const *set_layouts);
+
+/* KK_WORKAROUND_18 */
+bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
 
 bool kk_nir_lower_poly(struct nir_shader *nir);
 bool kk_nir_lower_null_images(nir_shader *nir);

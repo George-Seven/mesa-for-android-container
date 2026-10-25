@@ -31,7 +31,10 @@ propagate_cmod(jay_function *func, jay_inst *I, jay_inst **defs)
 
    /* Pattern match `cmp ssa, 0` or `cmp 0, ssa`. */
    jay_foreach_ssa_src(I, s) {
-      if (jay_is_zero(I->src[1 - s]) && jay_num_values(I->src[s]) == 1) {
+      if (jay_is_zero(I->src[1 - s]) &&
+          jay_num_values(I->src[s]) == 1 &&
+          !I->src[s].negate &&
+          !I->src[s].abs) {
          def = defs[jay_base_index(I->src[s])];
 
          /* Canonicalize the cmod to have the zero second */
@@ -206,8 +209,7 @@ propagate_forwards(jay_function *f)
              * ISA restrictions forbid 8-bit immediates, don't even try.
              */
             if ((I->src[s].file == def->src[0].file) ||
-                ((!jay_inst_has_default(I) ||
-                  &I->src[s] != jay_inst_get_default(I)) &&
+                (s <= I->num_srcs - I->predication &&
                  !(I->src[s].file == UFLAG && !jay_is_imm(def->src[0])) &&
                  !(I->src[s].file == FLAG) &&
                  !(I->predication &&
@@ -316,7 +318,7 @@ fuse_flag_op(jay_function *f, jay_inst *I, jay_inst *use, BITSET_WORD *defined)
    I->uniform = jay_is_uniform(use->dst);
    jay_def pred = use->op == JAY_OPCODE_OR ? jay_negate(other) : other;
    jay_builder b = jay_init_builder(f, jay_before_inst(I));
-   jay_add_predicate_else(&b, I, pred, other);
+   jay_add_predicate(&b, I, pred, other);
    return true;
 }
 
@@ -368,6 +370,7 @@ propagate_backwards(jay_function *f)
           use->op == JAY_OPCODE_MOV &&
           use->dst.file != J_ADDRESS &&
           jay_num_values(use->dst) == jay_num_values(use->src[0]) &&
+          !(I->op == JAY_OPCODE_SEND && I->dst.file != use->dst.file) &&
           (!jay_is_flag(use->dst) || jay_num_isa_srcs(I) < 3)) {
 
          *(flag ? &I->cond_flag : &I->dst) = use->dst;

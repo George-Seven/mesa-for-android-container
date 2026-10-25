@@ -214,6 +214,12 @@ d3d12_video_encoder_sync_completion(struct pipe_video_codec *codec,
       HRESULT hr = S_OK;
 
       auto &pool_entry = pD3D12Enc->m_inflightResourcesPool[pool_index];
+      // Command objects are NULL if destroy runs from a failed creation path
+      if (!pool_entry.m_CompletionFence ||
+          !pool_entry.m_spCommandAllocator ||
+          !pool_entry.m_spResolveCommandAllocator)
+         return false;
+
       if (!d3d12_fence_finish(pool_entry.m_CompletionFence.get(), timeout_ns))
          return false;
 
@@ -283,8 +289,13 @@ d3d12_video_encoder_destroy(struct pipe_video_codec *codec)
    if(pD3D12Enc->m_bPendingWorkNotFlushed){
       size_t pool_index = d3d12_video_encoder_pool_current_index(pD3D12Enc);
       d3d12_video_encoder_flush(codec);
-      d3d12_video_encoder_sync_completion(codec, pool_index, OS_TIMEOUT_INFINITE);
+      d3d12_fence_finish(pD3D12Enc->m_inflightResourcesPool[pool_index].m_CompletionFence.get(), OS_TIMEOUT_INFINITE);
    }
+
+   // Reset batches before destroying the encoder
+   // to avoid leaving command allocators in a non-reset state
+   for (uint32_t i = 0; i < pD3D12Enc->m_MaxQueueAsyncDepth; ++i)
+      (void) d3d12_video_encoder_sync_completion(codec, i, 0);
 
    if (pD3D12Enc->m_SliceHeaderRepackBuffer)
       pD3D12Enc->m_screen->resource_destroy(pD3D12Enc->m_screen, pD3D12Enc->m_SliceHeaderRepackBuffer);
@@ -2378,6 +2389,15 @@ d3d12_video_encoder_update_current_encoder_config_state(struct d3d12_video_encod
 #if VIDEO_CODEC_AV1ENC
       case PIPE_VIDEO_FORMAT_AV1:
       {
+         d3d12_video_encoder_update_output_stats_resources(pD3D12Enc,
+                                                           ((struct pipe_av1_enc_picture_desc *)picture)->gpu_stats_qp_map,
+                                                           ((struct pipe_av1_enc_picture_desc *)picture)->gpu_stats_satd_map,
+                                                           ((struct pipe_av1_enc_picture_desc *)picture)->gpu_stats_rc_bitallocation_map,
+                                                           ((struct pipe_av1_enc_picture_desc *)picture)->gpu_stats_psnr);
+
+         d3d12_video_encoder_update_move_rects(pD3D12Enc, ((struct pipe_av1_enc_picture_desc *)picture)->move_info);
+         d3d12_video_encoder_update_dirty_rects(pD3D12Enc, ((struct pipe_av1_enc_picture_desc *)picture)->dirty_info);
+
          d3d12_video_encoder_update_qpmap_input(pD3D12Enc, ((struct pipe_av1_enc_picture_desc *) picture)->input_qpmap_info,
                                                            ((struct pipe_av1_enc_picture_desc *)picture)->roi,
                                                            ((struct pipe_av1_enc_picture_desc *)picture)->temporal_id);
@@ -2971,6 +2991,10 @@ d3d12_video_encoder_begin_frame(struct pipe_video_codec * codec,
                    (uint64_t)current_pool_index);
       d3d12_fence_finish(pD3D12Enc->m_inflightResourcesPool[current_pool_index].m_CompletionFence.get(), OS_TIMEOUT_INFINITE);
    }
+
+   // Opportunistically reset batches
+   for (uint32_t i = 0; i < pD3D12Enc->m_MaxQueueAsyncDepth; ++i)
+      (void) d3d12_video_encoder_sync_completion(codec, i, 0);
 
    if (!d3d12_video_encoder_reconfigure_session(pD3D12Enc, target, picture)) {
       debug_printf("[d3d12_video_encoder] d3d12_video_encoder_begin_frame - Failure on "
