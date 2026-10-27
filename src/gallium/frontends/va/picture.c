@@ -101,7 +101,7 @@ vlVaBeginPicture(VADriverContextP ctx, VAContextID context_id, VASurfaceID rende
    if (!drv)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: begin picture context=%u target=%u\n",
+   TVA_VA_LOG("tva-va: begin picture context=%u target=%u\n",
            context_id, render_target);
 
    mtx_lock(&drv->mutex);
@@ -200,7 +200,7 @@ vlVaRenderPicture(VADriverContextP ctx, VAContextID context_id, VABufferID *buff
    if (!drv)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: render picture context=%u buffers=%d\n",
+   TVA_VA_LOG("tva-va: render picture context=%u buffers=%d\n",
            context_id, num_buffers);
 
    mtx_lock(&drv->mutex);

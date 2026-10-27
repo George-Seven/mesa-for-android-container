@@ -12,10 +12,15 @@ libva_files = files(
     'picture.c', 'surface.c', 'decode.c', 'image.c'
 )
 
-# termux-va bridge: forwards VA decode over a Unix socket to the Termux
-# daemon.  Compiled in unless disabled; activation is runtime-gated.
+# termux-va VA frontend: uses a socket backend in guest builds or direct
+# MediaCodec calls in Android builds. The backend is selected at build time.
 if with_termux_va_bridge
-  libva_files += files('tva_client.c', 'tva_bridge.c', 'tva_protocol.h',
+  if with_termux_va_direct
+    libva_files += files('tva_client_mediacodec.c')
+  else
+    libva_files += files('tva_client.c')
+  endif
+  libva_files += files('tva_bridge.c', 'tva_protocol.h',
     'bitstream.c', 'bitstream.h', 'av1_bitstream.c', 'av1_bitstream.h')
 endif
 
@@ -69,6 +74,6 @@ libva_st = static_library(
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [
     dep_va_headers_sources, dep_x11_xcb, dep_xcb, dep_xcb_dri3,
-    dep_libdrm, idep_mesautil,
+    dep_libdrm, idep_mesautil, dep_mediandk, dep_android,
   ],
 )

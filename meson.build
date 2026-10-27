@@ -860,6 +860,13 @@ _va_drivers = [
 
 allow_fallback_for_libva = get_option('allow-fallback-for').contains('libva')
 _termux_va_bridge = get_option('termux-va-bridge')
+_termux_va_direct = get_option('termux-va-direct')
+if _termux_va_direct.enabled() and host_machine.system() != 'android'
+  error('-Dtermux-va-direct requires an Android/Bionic target')
+endif
+if _termux_va_direct.enabled() and _termux_va_bridge.disabled()
+  error('-Dtermux-va-direct requires the termux-va VA frontend')
+endif
 _va = get_option('gallium-va') \
   .require(_va_drivers.contains(true) or not _termux_va_bridge.disabled(),
            error_message : 'VA state tracker requires at least one of the following gallium drivers: r600, radeonsi, nouveau, d3d12 (with option gallium-d3d12-video), virgl, or -Dtermux-va-bridge for the termux-va bridge.')
@@ -885,10 +892,23 @@ if dep_va.found()
                                 dependencies: dep_va_headers).split('.')
 endif
 with_gallium_va = dep_va.found()
-# The termux-va bridge is compiled into the VA frontend whenever it is not
-# explicitly disabled; activation is decided at runtime by the TERMUX_VA_*
-# environment variables (see src/gallium/frontends/va/tva_bridge.c).
+# The termux-va VA frontend is compiled whenever it is not explicitly
+# disabled. Guest builds activate it through TERMUX_VA_* settings; direct
+# Android builds always activate it and use MediaCodec in-process.
 with_termux_va_bridge = with_gallium_va and not _termux_va_bridge.disabled()
+if _termux_va_direct.enabled() and not with_gallium_va
+  error('-Dtermux-va-direct requires -Dgallium-va=enabled')
+endif
+with_termux_va_direct = with_termux_va_bridge and _termux_va_direct.enabled()
+if with_termux_va_direct
+  pre_args += '-DTERMUX_VA_DIRECT'
+endif
+dep_mediandk = null_dep
+dep_android = null_dep
+if with_termux_va_direct
+  dep_mediandk = cc.find_library('mediandk', required : true)
+  dep_android = cc.find_library('android', required : true)
+endif
 
 _termux_va_wayland_shim = get_option('termux-va-wayland-shim')
 if _termux_va_wayland_shim.enabled()

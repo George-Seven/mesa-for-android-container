@@ -112,7 +112,14 @@ option(
   'termux-va-bridge',
   type : 'feature',
   value : 'auto',
-  description : 'build the termux-va bridge into the VA frontend (VA decode forwarded over a Unix socket to the Termux termux-va daemon; runtime-gated by the TERMUX_VA_* environment variables)',
+  description : 'build the termux-va VA frontend (socket backend for guest builds; runtime-gated unless direct Android mode is selected)',
+)
+
+option(
+  'termux-va-direct',
+  type : 'feature',
+  value : 'disabled',
+  description : 'build the termuxva VA driver with in-process Android MediaCodec (Bionic only; no daemon or socket)',
 )
 
 option(

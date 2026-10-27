@@ -110,6 +110,11 @@ static unsigned tva_pipeline_depth_default = 6;
 /* ----------------------------------------------------------- activation */
 bool tva_bridge_active(void)
 {
+#ifdef TERMUX_VA_DIRECT
+    /* A direct Termux build owns MediaCodec in this process; there is no
+     * daemon endpoint to probe and no socket-mode fallback. */
+    return true;
+#endif
     const char *force = os_get_option("TERMUX_VA_BRIDGE");
     if (force && *force) {
         return !(strcmp(force, "0") == 0 || strcmp(force, "false") == 0 ||
@@ -5115,6 +5120,24 @@ tva_bridge_vscreen_create(int fd, bool honor_dri_prime)
         backend = "auto";
 
 #if defined(__linux__)
+    /* /dev/kgsl-3d0 is a KGSL character device, not a DRM render node.  A
+     * libva DRM display may nevertheless pass its fd here (for example when
+     * the Termux DRM shim is preloaded).  In auto mode, prefer the dedicated
+     * KGSL Freedreno screen whenever there is no real DRM render node; sending
+     * the shim fd through the generic DRM loader can select Zink/Turnip and
+     * later crash while exporting VA video surfaces as dma-bufs. */
+    if ((!strcmp(backend, "auto") || !strcmp(backend, "kgsl")) &&
+        access("/dev/kgsl-3d0", R_OK) == 0 &&
+        !tva_drm_render_node_present()) {
+        if (opened_fd < 0)
+            opened_fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
+        if (opened_fd >= 0) {
+            fd = opened_fd;
+            if (!strcmp(backend, "auto"))
+                backend = "kgsl";
+        }
+    }
+
     /* An X11 VA display in a PRoot container does not carry a DRM fd.  Open
      * KGSL here so the bridge can still create a GPU screen without a DRM
      * render node; the loader override below selects the KGSL alias. */

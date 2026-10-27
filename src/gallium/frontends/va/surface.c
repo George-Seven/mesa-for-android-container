@@ -42,6 +42,7 @@
 #include "vl/vl_winsys.h"
 
 #include "va_private.h"
+#include "tva_bridge.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -65,8 +66,7 @@ vl_va_export_debug_enabled(void)
 static bool
 vl_va_bridge_skip_clear(void)
 {
-   const char *e = getenv("TERMUX_VA_BRIDGE");
-   return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+   return tva_bridge_active();
 }
 
 static bool
@@ -472,7 +472,7 @@ vlVaQuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config_id,
    struct pipe_screen *pscreen;
    int i;
 
-   fprintf(stderr, "tva-va: query surface attrs config=%u list=%p count=%u\n",
+   TVA_VA_LOG("tva-va: query surface attrs config=%u list=%p count=%u\n",
            config_id, (void *)attrib_list, num_attribs ? *num_attribs : 0);
 
    if (config_id == VA_INVALID_ID)
@@ -483,7 +483,7 @@ vlVaQuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config_id,
 
    if (!attrib_list) {
       *num_attribs = VL_VA_MAX_IMAGE_FORMATS + VASurfaceAttribCount;
-      fprintf(stderr, "tva-va: query surface attrs count=%u\n", *num_attribs);
+      TVA_VA_LOG("tva-va: query surface attrs count=%u\n", *num_attribs);
       return VA_STATUS_SUCCESS;
    }
 
@@ -662,7 +662,7 @@ vlVaQuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config_id,
    if (i > *num_attribs) {
       *num_attribs = i;
       FREE(attribs);
-      fprintf(stderr, "tva-va: query surface attrs too small need=%d\n", i);
+      TVA_VA_LOG("tva-va: query surface attrs too small need=%d\n", i);
       return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
    }
 
@@ -670,7 +670,7 @@ vlVaQuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config_id,
    memcpy(attrib_list, attribs, i * sizeof(VASurfaceAttrib));
    FREE(attribs);
 
-   fprintf(stderr, "tva-va: query surface attrs success count=%d\n", i);
+   TVA_VA_LOG("tva-va: query surface attrs success count=%d\n", i);
 
    return VA_STATUS_SUCCESS;
 }
@@ -835,7 +835,7 @@ surface_find_prime_producer_for_surface(vlVaDriver *drv,
             if (match) {
                close(import_handle.handle);
                if (getenv("DMD_VA_PROBE"))
-                  fprintf(stderr, "tva-va: prime producer matched import=%p "
+                  TVA_VA_LOG("tva-va: prime producer matched import=%p "
                           "producer=%p plane=%u fence=%p ctx=%p\n",
                           (void *)import_surface, (void *)candidate,
                           candidate_plane, (void *)candidate->fence,
@@ -870,7 +870,7 @@ surface_from_prime(VADriverContextP ctx, vlVaSurface *surface,
    drv = VL_VA_DRIVER(ctx);
 
    if (getenv("DMD_VA_PROBE")) {
-      fprintf(stderr, "tva-va: import prime surface=%p type=%#x desc=%p "
+      TVA_VA_LOG("tva-va: import prime surface=%p type=%#x desc=%p "
               "fourcc=%#x size=%ux%u objects=%u layers=%u\n",
               (void *)surface, mem_type, (void *)desc,
               desc ? desc->fourcc : 0, desc ? desc->width : 0,
@@ -878,14 +878,14 @@ surface_from_prime(VADriverContextP ctx, vlVaSurface *surface,
               desc ? desc->num_layers : 0);
       if (desc) {
          for (unsigned i = 0; i < desc->num_objects; i++)
-            fprintf(stderr, "tva-va: import prime object[%u] fd=%d size=%u mod=%#llx\n",
+            TVA_VA_LOG("tva-va: import prime object[%u] fd=%d size=%u mod=%#llx\n",
                     i, desc->objects[i].fd, desc->objects[i].size,
                     (unsigned long long)desc->objects[i].drm_format_modifier);
          for (unsigned i = 0; i < desc->num_layers; i++) {
-            fprintf(stderr, "tva-va: import prime layer[%u] fmt=%#x planes=%u\n",
+            TVA_VA_LOG("tva-va: import prime layer[%u] fmt=%#x planes=%u\n",
                     i, desc->layers[i].drm_format, desc->layers[i].num_planes);
             for (unsigned j = 0; j < desc->layers[i].num_planes; j++)
-               fprintf(stderr, "tva-va: import prime layer[%u].plane[%u] obj=%u "
+               TVA_VA_LOG("tva-va: import prime layer[%u].plane[%u] obj=%u "
                        "pitch=%u offset=%u\n", i, j,
                        desc->layers[i].object_index[j],
                        desc->layers[i].pitch[j], desc->layers[i].offset[j]);
@@ -1002,7 +1002,7 @@ surface_from_prime(VADriverContextP ctx, vlVaSurface *surface,
    surface->sync_surface = surface_find_prime_producer_for_surface(drv, surface);
    surface->prime_fence = surface->sync_surface ? surface->sync_surface->fence : NULL;
    if (getenv("DMD_VA_PROBE"))
-      fprintf(stderr, "tva-va: prime import producer=%p fence=%p\n",
+      TVA_VA_LOG("tva-va: prime import producer=%p fence=%p\n",
               (void *)surface->sync_surface, (void *)surface->prime_fence);
 
    return VA_STATUS_SUCCESS;
@@ -1062,7 +1062,7 @@ vlVaHandleSurfaceAllocate(vlVaDriver *drv, vlVaSurface *surface,
    struct pipe_surface *surfaces;
    unsigned i;
 
-   fprintf(stderr, "tva-va: allocate surface=%p format=%d size=%ux%u modifiers=%u\n",
+   TVA_VA_LOG("tva-va: allocate surface=%p format=%d size=%ux%u modifiers=%u\n",
            (void *)surface,
            surface ? surface->templat.buffer_format : -1,
            surface ? surface->templat.width : 0,
@@ -1081,11 +1081,11 @@ vlVaHandleSurfaceAllocate(vlVaDriver *drv, vlVaSurface *surface,
    }
    if (!surface->buffer)
    {
-      fprintf(stderr, "tva-va: surface allocation failed\n");
+      TVA_VA_LOG("tva-va: surface allocation failed\n");
       return VA_STATUS_ERROR_ALLOCATION_FAILED;
    }
 
-   fprintf(stderr, "tva-va: surface allocation ready buffer=%p\n",
+   TVA_VA_LOG("tva-va: surface allocation ready buffer=%p\n",
            (void *)surface->buffer);
 
    /* The termux-va bridge fills every plane before exporting a decoded
@@ -1133,7 +1133,7 @@ vlVaGetSurfaceBuffer(vlVaDriver *drv, vlVaSurface *surface)
    if (surface->buffer)
       return surface->buffer;
    vlVaHandleSurfaceAllocate(drv, surface, NULL, 0);
-   fprintf(stderr, "tva-va: get surface buffer=%p\n", (void *)surface->buffer);
+   TVA_VA_LOG("tva-va: get surface buffer=%p\n", (void *)surface->buffer);
    return surface->buffer;
 }
 
@@ -1225,7 +1225,7 @@ vlVaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: create surfaces format=%#x size=%ux%u count=%u attrs=%u\n",
+   TVA_VA_LOG("tva-va: create surfaces format=%#x size=%ux%u count=%u attrs=%u\n",
            format, width, height, num_surfaces, num_attribs);
 
    if (!(width && height))
@@ -1327,7 +1327,7 @@ vlVaCreateSurfaces2(VADriverContextP ctx, unsigned int format,
    }
 
    if (getenv("DMD_VA_PROBE")) {
-      fprintf(stderr, "tva-va: surface attrs resolved type=%#x expected=%#x "
+      TVA_VA_LOG("tva-va: surface attrs resolved type=%#x expected=%#x "
               "prime=%p ext=%p modifiers=%u bind=%#x\n", memory_type,
               expected_fourcc, (void *)prime_desc, (void *)memory_attribute,
               modifiers_count, templat.bind);

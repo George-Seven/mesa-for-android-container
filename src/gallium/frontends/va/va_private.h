@@ -30,6 +30,8 @@
 #define VA_PRIVATE_H
 
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <va/va.h>
 #include <va/va_backend.h>
@@ -57,6 +59,13 @@
 
 #define VL_VA_DRIVER(ctx) ((vlVaDriver *)ctx->pDriverData)
 #define VL_VA_PSCREEN(ctx) (VL_VA_DRIVER(ctx)->vscreen->pscreen)
+
+/* Termux VA frontend tracing is quiet unless explicitly requested. */
+#define TVA_VA_LOG(...) \
+   do { \
+      if (getenv("DMD_VA_LOG")) \
+         fprintf(stderr, __VA_ARGS__); \
+   } while (0)
 
 #define VL_VA_MAX_IMAGE_FORMATS 23
 #define VL_VA_ENC_GOP_COEFF 16

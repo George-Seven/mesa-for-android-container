@@ -2546,7 +2546,12 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
    VkSemaphore sem = VK_NULL_HANDLE;
 #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
    static bool no_dma_buf_sync_file = false;
-   if (no_dma_buf_sync_file)
+   /* Android Vulkan implementations may expose dma-buf resources without
+    * supporting the external sync-file semaphore extension.  In that case
+    * the generated Vulkan dispatch entry can be NULL; don't call it. */
+   if (no_dma_buf_sync_file || sem == VK_NULL_HANDLE ||
+       !screen->info.have_KHR_external_semaphore_fd ||
+       !VKSCR(GetSemaphoreFdKHR))
       return sem;
 
    struct dma_buf_export_sync_file export = {
@@ -2596,8 +2601,12 @@ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
 {
 #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
    static bool no_dma_buf_sync_file = false;
-   if (no_dma_buf_sync_file)
-      return sem;
+   /* Keep dma-buf sync-file interop optional.  Some Android Vulkan drivers
+    * do not provide vkGetSemaphoreFdKHR even when Mesa was built with DRM. */
+   if (no_dma_buf_sync_file || sem == VK_NULL_HANDLE ||
+       !screen->info.have_KHR_external_semaphore_fd ||
+       !VKSCR(GetSemaphoreFdKHR))
+      return true;
 
    const VkSemaphoreGetFdInfoKHR get_fd_info = {
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,

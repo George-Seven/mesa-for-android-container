@@ -110,7 +110,7 @@ struct tva_session_config {
     int      io_timeout_ms;     /* <=0 = TVA_DEF_IO_MS */
 };
 
-/* Fill cfg with defaults (H.264, inline, default timeouts). */
+/* Fill cfg with H.264 and the default frame rate and timeout. */
 void tva_session_config_defaults(struct tva_session_config *cfg);
 
 /*
@@ -200,9 +200,9 @@ struct tva_frame {
 struct tva_session;
 
 /*
- * Create a session: connect to the daemon, handshake, and (if requested)
- * take over the shared memory pool.  Returns NULL on failure; err (optional)
- * receives the reason.  No fd or mapping leaks on failure.
+ * Create the selected backend session. Socket builds connect and handshake;
+ * direct Android builds configure an in-process MediaCodec. Returns NULL on
+ * failure; err (optional) receives the reason.
  */
 struct tva_session *tva_session_create(const struct tva_session_config *cfg,
                                        struct tva_error *err);

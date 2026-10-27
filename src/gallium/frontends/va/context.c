@@ -135,7 +135,7 @@ VA_DRIVER_INIT_FUNC(VADriverContextP ctx)
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: driver init display_type=%lu\n",
+   TVA_VA_LOG("tva-va: driver init display_type=%lu\n",
            (unsigned long)ctx->display_type);
 
    drv = CALLOC(1, sizeof(vlVaDriver));
@@ -155,8 +155,16 @@ VA_DRIVER_INIT_FUNC(VADriverContextP ctx)
    }
 #else
    case VA_DISPLAY_ANDROID:
+#ifdef TERMUX_VA_DIRECT
+      /* Termux runs this VA driver in the Android process. It does not have
+       * a Linux guest DRM display fd, so initialize the same direct KGSL / SW
+       * Gallium screen used by the in-process MediaCodec backend. */
+      drv->vscreen = tva_bridge_vscreen_create(-1, false);
+      break;
+#else
       FREE(drv);
       return VA_STATUS_ERROR_UNIMPLEMENTED;
+#endif
    case VA_DISPLAY_GLX:
    case VA_DISPLAY_X11:
 #ifdef GALLIUM_ZINK
@@ -220,7 +228,7 @@ VA_DRIVER_INIT_FUNC(VADriverContextP ctx)
    if (!drv->vscreen)
       goto error_screen;
 
-   fprintf(stderr, "tva-va: driver screen ready\n");
+   TVA_VA_LOG("tva-va: driver screen ready\n");
 
    struct pipe_screen *raw_pscreen = drv->vscreen->pscreen;
 
@@ -317,7 +325,7 @@ vlVaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width,
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: create context config=%u size=%dx%d targets=%d\n",
+   TVA_VA_LOG("tva-va: create context config=%u size=%dx%d targets=%d\n",
            config_id, picture_width, picture_height, num_render_targets);
 
    drv = VL_VA_DRIVER(ctx);
@@ -327,7 +335,7 @@ vlVaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width,
 
    if (!config)
    {
-      fprintf(stderr, "tva-va: create context invalid config\n");
+      TVA_VA_LOG("tva-va: create context invalid config\n");
       return VA_STATUS_ERROR_INVALID_CONFIG;
    }
 
@@ -490,7 +498,7 @@ vlVaCreateContext(VADriverContextP ctx, VAConfigID config_id, int picture_width,
       }
    }
 
-   fprintf(stderr, "tva-va: create context success id=%u decoder=%p\n",
+   TVA_VA_LOG("tva-va: create context success id=%u decoder=%p\n",
            *context_id, (void *)context->decoder);
    return VA_STATUS_SUCCESS;
 }
@@ -504,7 +512,7 @@ vlVaDestroyContext(VADriverContextP ctx, VAContextID context_id)
    if (!ctx)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-   fprintf(stderr, "tva-va: destroy context id=%u\n", context_id);
+   TVA_VA_LOG("tva-va: destroy context id=%u\n", context_id);
 
    if (context_id == 0)
       return VA_STATUS_ERROR_INVALID_CONTEXT;
